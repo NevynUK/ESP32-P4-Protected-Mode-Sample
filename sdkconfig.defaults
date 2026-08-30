@@ -1,0 +1,20 @@
+CONFIG_IDF_TARGET="esp32p4"
+
+# The M5Stack Tab5's part reports revision v1.0.  IDF defaults to a minimum of
+# v3.1 and the bootloader refuses to flash otherwise ("requires chip revision in
+# range [v3.1 - v3.99]").  The <3.0 revisions are gated behind an explicit
+# opt-in because IDF cannot support both families in one binary.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# Console on UART0 (GPIO37/38 on the P4), which on this board reaches the
+# external USB bridge -- /dev/cu.usbserial-*.  That leaves the USB-Serial/JTAG
+# port free for esptool and OpenOCD, so a run can be captured while the board
+# is reset through the other port.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# The failure under test is a HANG.  Let it hang: a watchdog reset would hide
+# the state we want to halt and inspect over JTAG.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_BOOTLOADER_WDT_ENABLE=n
