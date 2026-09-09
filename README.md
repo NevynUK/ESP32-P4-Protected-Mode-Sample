@@ -1,4 +1,4 @@
-# ESP32-P4: an ESP-IDF application split across M-mode and U-mode
+# ESP32-P4: An ESP-IDF Application Split Across M-mode and U-mode
 
 A teaching reference. An ESP-IDF app whose kernel runs in machine mode and
 whose user applications run, genuinely, in user mode — two of them, one per
@@ -12,30 +12,30 @@ this is the thing the control was clearing the way for.
 
 ---
 
-## How to use this document
+## How to Use This Document
 
 It is written to be worked through, not skimmed. The order is deliberate:
 
-1. **[Quick start](#quick-start)** — get it running on hardware first. Nothing
+1. **[Quick Start](#quick-start)** — get it running on hardware first. Nothing
    below means much until you have watched it work.
-2. **[Part 1: the concepts](#part-1--the-concepts)** — the four ideas the code
+2. **[Part 1: The Concepts](#part-1--the-concepts)** — the four ideas the code
    is built out of.
-3. **[Part 2: reading the code](#part-2--reading-the-code)** — a route through
+3. **[Part 2: Reading the Code](#part-2--reading-the-code)** — a route through
    the source, with what to look for in each file.
-4. **[Part 3: five things that do not work the obvious
-   way](#part-3--five-things-that-do-not-work-the-obvious-way)** — the real
+4. **[Part 3: Five Things That Do Not Work the Obvious
+   Way](#part-3--five-things-that-do-not-work-the-obvious-way)** — the real
    content. Each is a bug that was hit, diagnosed and fixed in this tree, and
    each teaches something the datasheet does not tell you.
-5. **[Part 4: exercises](#part-4--exercises)** — break it deliberately. Most
+5. **[Part 4: Exercises](#part-4--exercises)** — break it deliberately. Most
    have captured output so you can check your answer.
-6. **[Part 5: the limit of the isolation](#part-5--the-limit-of-the-isolation-stated-plainly)**
+6. **[Part 5: The Limit of the Isolation](#part-5--the-limit-of-the-isolation-stated-plainly)**
    — what this does *not* protect, and why.
 7. **[Reference](#reference)** — syscall table, files, build, gotchas, further
    reading, glossary.
 
 If you only read one section, read **Part 3**.
 
-## What you will learn
+## What You Will Learn
 
 - How RISC-V M-mode and U-mode actually divide a real SoC, and what the
   hardware does when the boundary is crossed.
@@ -60,7 +60,7 @@ peripheral is explained where it is used, and collected in the
 Hardware is required for the exercises. Reading Parts 1–3 does not need a
 board.
 
-## Quick start
+## Quick Start
 
 ```bash
 ./build.sh          # configure for esp32p4 if needed, then build
@@ -74,7 +74,7 @@ external bridge on UART0, which `sdkconfig.defaults` puts the console on
 deliberately — so the board can be reset and reflashed through one port while a
 capture is held open on the other.
 
-## What it does
+## What It Does
 
 Two U-mode applications and one M-mode task run concurrently. On boot the
 kernel prints what the privilege and memory configuration actually **is**,
@@ -120,7 +120,7 @@ User 0.2
 User 1.2
 ```
 
-| line | emitted by | privilege | core | cadence | path |
+| Line | Emitted by | Privilege | Core | Cadence | Path |
 |---|---|---|---|---|---|
 | `Kernel x` | `kernel_task` | M | 0 | 1 s | `printf` |
 | `User 0.y` | `user_main(0)` | **U** | 0 | 2 s | `SYS_WRITE` |
@@ -143,26 +143,26 @@ while a U-mode window is parked.
 
 ---
 
-# Part 1 — The concepts
+# Part 1 — The Concepts
 
-## 1.1 Two privilege modes, one binary
+## 1.1 Two Privilege Modes, One Binary
 
 The ESP32-P4's cores are RV32 with M and U privilege modes. ESP-IDF and
 FreeRTOS live entirely in M-mode. This app carves out U-mode for the
 application code:
 
-| | M-mode (the kernel) | U-mode (the user) |
+|  | M-mode (the Kernel) | U-mode (the User) |
 |---|---|---|
-| CSR access | yes | **illegal instruction** |
-| `mret`, `wfi`, other privileged instructions | yes | **illegal instruction** |
-| FreeRTOS calls | yes | impossible — they take locks, locks use CSRs |
-| Memory | all of it | whatever the PMP grants (see [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly)) |
+| CSR access | Yes | **Illegal instruction** |
+| `mret`, `wfi`, other privileged instructions | Yes | **Illegal instruction** |
+| FreeRTOS calls | Yes | Impossible — they take locks, locks use CSRs |
+| Memory | All of it | Whatever the PMP grants (see [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly)) |
 | Way to reach the other side | `mret` | `ecall` — the only one |
 
 The privilege boundary is real and you can prove it in one line of user code —
 see [Exercise 1](#exercise-1-execute-a-privileged-instruction).
 
-## 1.2 U-mode is not a task; it is a coroutine hosted by one
+## 1.2 U-mode Is Not a Task; It Is a Coroutine Hosted by One
 
 FreeRTOS has no notion of a user mode, and this tree does not modify FreeRTOS.
 So U-mode is not a task. A perfectly ordinary FreeRTOS task **hosts** it:
@@ -200,20 +200,20 @@ would be unable to block, unable to log, and unable to use most of the RTOS.
 Every way out of U-mode comes back through the same call: a syscall, a fault,
 or an interrupt. The host loop tells them apart from `mcause`.
 
-## 1.3 The syscall interface
+## 1.3 The Syscall Interface
 
 `a7` carries the number, `a0`/`a1` the arguments, `a0` the result — the RISC-V
 norm. The kernel writes the result into the saved `a0` and steps the saved `pc`
 past the `ecall` before resuming, so the user resumes at the instruction after
 the trap with its return value in place.
 
-| # | call | arguments | on error |
+| # | Call | Arguments | On Error |
 |---|---|---|---|
 | 0 | `SYS_NOP` | — | — |
-| 1 | `SYS_WRITE` | buffer, length → bytes written | `SYS_ERR_FAULT`, user continues |
+| 1 | `SYS_WRITE` | Buffer, length → bytes written | `SYS_ERR_FAULT`, user continues |
 | 2 | `SYS_PUTS` | NUL-terminated message → 0 | `SYS_ERR_FAULT`, user continues |
-| 3 | `SYS_DELAY_MS` | milliseconds | — |
-| 4 | `SYS_EXIT` | status; does not return | — |
+| 3 | `SYS_DELAY_MS` | Milliseconds | — |
+| 4 | `SYS_EXIT` | Status; does not return | — |
 
 `SYS_PUTS` is message passing: U-mode hands over a string, the kernel validates
 it, copies it out of the user's arena and prints it. `SYS_WRITE` is separate on
@@ -229,7 +229,7 @@ a fatal fault. A privilege violation or a stack excursion retires the context.
 Both behaviours are worth seeing — Exercises [1](#exercise-1-execute-a-privileged-instruction)
 and [3](#exercise-3-hand-the-kernel-a-pointer-outside-your-arena).
 
-## 1.4 One window per core, and what that forces
+## 1.4 One Window per Core, and What That Forces
 
 There are two U-mode windows, one per core, running at the same time. Getting
 there is mostly a lesson in **which processor state is per-hart**.
@@ -266,7 +266,7 @@ The console mutex is the only thing the two deliberately share.
 
 ---
 
-# Part 2 — Reading the code
+# Part 2 — Reading the Code
 
 All assembly is in `.S` files. There is no inline assembly anywhere, including
 for CSR reads — `umode_read_mstatus()` and friends are real functions in
@@ -274,13 +274,13 @@ for CSR reads — `umode_read_mstatus()` and friends are real functions in
 
 Suggested order:
 
-| # | file | privilege | read it for |
+| # | File | Privilege | Read It for |
 |---|---|---|---|
-| 1 | `main/syscall.h` | both | the kernel/user ABI. Smallest file, start here |
-| 2 | `main/user_main.c` | **U** | what unprivileged code can and cannot do. Note what is *absent*: no `printf`, no library calls, no writable statics |
-| 3 | `main/user_syscall.S` | **U** | the `ecall` stubs and the exit trampoline. Twenty lines that are the whole user-to-kernel path |
-| 4 | `main/umode.h` | both | the context layout, shared with `umode.S` as byte offsets |
-| 5 | `main/kernel_main.c` | M | the kernel: boot report, `user_slot_t`, the host loop, syscall dispatch, pointer validation |
+| 1 | `main/syscall.h` | Both | The kernel/user ABI. Smallest file, start here |
+| 2 | `main/user_main.c` | **U** | What unprivileged code can and cannot do. Note what is *absent*: no `printf`, no library calls, no writable statics |
+| 3 | `main/user_syscall.S` | **U** | The `ecall` stubs and the exit trampoline. Twenty lines that are the whole user-to-kernel path |
+| 4 | `main/umode.h` | Both | The context layout, shared with `umode.S` as byte offsets |
+| 5 | `main/kernel_main.c` | M | The kernel: boot report, `user_slot_t`, the host loop, syscall dispatch, pointer validation |
 | 6 | `main/umode.S` | M | `umode_enter()`, the private trap vector, the CLIC vector table. Read last; Part 3 is mostly about this file |
 
 Things to look for as you go:
@@ -295,7 +295,7 @@ Things to look for as you go:
 - In `umode.S`: the ordering comments are not decoration. Several sequences are
   correct only in the order written, and Part 3 explains four of them.
 
-## Why the user application looks the way it does
+## Why the User Application Looks the Way It Does
 
 Four constraints, all consequences of running unprivileged:
 
@@ -327,12 +327,12 @@ out, so a user that clobbers them cannot hurt the kernel.
 
 ---
 
-# Part 3 — Five things that do not work the obvious way
+# Part 3 — Five Things That Do Not Work the Obvious Way
 
 Each of these was a real bug in this tree. They are the reason the code is
 shaped the way it is, and they are the most transferable content here.
 
-## 3.1 The hardware stack guard fires on the stack switch
+## 3.1 The Hardware Stack Guard Fires on the Stack Switch
 
 `CONFIG_ESP_SYSTEM_HW_STACK_GUARD` arms the ESP32-P4's debug assist SP monitor
 on the bounds of whichever FreeRTOS task is current. U-mode runs on its own
@@ -392,7 +392,7 @@ next syscall is still there to be read, so a transient dip is caught with `sp`
 already back in range and the latched PC pointing at the instruction that did
 it. [Exercise 2](#exercise-2-run-your-stack-off-its-arena) shows exactly that.
 
-## 3.2 The CLIC threshold write is not immediately effective
+## 3.2 The CLIC Threshold Write Is Not Immediately Effective
 
 `mstatus.MIE` does **not** mask interrupts while the core is in U-mode. The only
 lever is the CLIC threshold, which on the pre-rev3 P4 is a *memory-mapped*
@@ -416,18 +416,18 @@ The cost: a user that computes for a long time between syscalls delays the tick
 on its core, so the user model here is a cooperative one. In this application
 the gap between syscalls is a few microseconds.
 
-## 3.3 `mcause` aliases `mstatus.MPP`
+## 3.3 `mcause` Aliases `mstatus.MPP`
 
 On the pre-rev3 P4 the CLIC packs previous privilege, previous interrupt-enable
 and previous interrupt level into `mcause`:
 
-| bits | field |
+| Bits | Field |
 |---|---|
-| 31 | interrupt |
+| 31 | Interrupt |
 | 29:28 | `mpp` — **write-through aliased to `mstatus.MPP`** |
 | 27 | `mpie` |
 | 23:16 | `mpil` — `mret` restores `mintstatus.mil` from this |
-| 11:0 | exception code |
+| 11:0 | Exception code |
 
 Because 29:28 and `mstatus.MPP` are the same state, **whichever of the two is
 written last decides the privilege the `mret` returns to.** `umode.S` writes
@@ -439,7 +439,7 @@ This is also why the exit path leaves through an `mret` rather than a jump: the
 hardware restores `mintstatus.mil` from `mcause.mpil` as part of the `mret`, and
 a jump would leave the core at the wrong interrupt level.
 
-## 3.4 The context pointer travels in `mscratch`
+## 3.4 The Context Pointer Travels in `mscratch`
 
 `mscratch` is how the trap vector finds the context. Nothing in ESP-IDF uses
 that CSR on this target, which is what makes it available; the kernel's value is
@@ -450,7 +450,7 @@ in `t0` and the *user's* `t0` parked in `mscratch`, to be recovered a few
 instructions later. Using `t0` rather than the conventional `sp` is what
 [3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch) requires.
 
-## 3.5 One interrupt source, two monitors
+## 3.5 One Interrupt Source, Two Monitors
 
 `ETS_ASSIST_DEBUG_INTR_SOURCE` is **one** source in the interrupt matrix, and
 `esp_hw_stack_guard_init()` runs on every core, so each core routes it to its own
@@ -499,7 +499,7 @@ hardware; the rest tell you what to look for.
 
 Add the probe, `./flash.sh`, `./monitor.sh`, then take the probe out again.
 
-## Exercise 1: execute a privileged instruction
+## Exercise 1: Execute a Privileged Instruction
 
 *Does the privilege boundary actually exist?* Add to `user_main`'s loop:
 
@@ -534,7 +534,7 @@ Three things to take from that:
 
 Try it with `mret`, `wfi`, or a write to `pmpcfg0` and compare `mtval`.
 
-## Exercise 2: run your stack off its arena
+## Exercise 2: Run Your Stack Off Its Arena
 
 *Does the handed-over stack guard work?* Add:
 
@@ -566,7 +566,7 @@ transient, and it was caught anyway, because `INTR_RAW` is sticky
 pc` is the instruction the peripheral latched — the `add` that did it. The
 bounds printed are **user1's own** arena, read from core 1's register block.
 
-## Exercise 3: hand the kernel a pointer outside your arena
+## Exercise 3: Hand the Kernel a Pointer Outside Your Arena
 
 *Is pointer validation doing anything?* Add:
 
@@ -590,7 +590,7 @@ pointer is a recoverable syscall error — `SYS_ERR_FAULT` in `a0` — because a
 handing over a bad pointer is a bug in the user, not a privilege violation.
 Contrast with Exercises 1 and 2, which both retire the context.
 
-## Exercise 4: reach into the other user's arena
+## Exercise 4: Reach into the Other User's Arena
 
 Take the address the boot report prints for the *other* user's arena and pass it
 to `SYS_PUTS`. Expect the same rejection as Exercise 3.
@@ -603,7 +603,7 @@ this check. To see the check itself rather than a user's view of it, call
 `user_range_ok(&g_slots[0], (uint32_t)(uintptr_t) g_slots[1].arena, 1)` in
 `kernel_main()` and print the result.
 
-## Exercise 5: change which cores the windows run on
+## Exercise 5: Change Which Cores the Windows Run on
 
 `USER_CORE(n)` in `kernel_main.c` maps slot to core. Try:
 
@@ -617,13 +617,13 @@ you built, and the un-route in `kernel_main()` is wider than it needs to be.
 Watch the two windows time-slice on a single core instead of running
 concurrently.
 
-## Exercise 6: return from `user_main`
+## Exercise 6: Return from `user_main`
 
 Delete the `for (;;)` so `user_main` falls off its end. The context is created
 with `ra` pointing at `u_exit_stub`, so this becomes a `SYS_EXIT` rather than a
 wild branch. Expect `user_main exited, status …` and a clean retirement.
 
-## Exercise 7: leave interrupts unmasked
+## Exercise 7: Leave Interrupts Unmasked
 
 Comment out the threshold raise in `umode_enter` and see how far it gets.
 Predict first — [3.2](#32-the-clic-threshold-write-is-not-immediately-effective)
@@ -633,7 +633,7 @@ interrupt-in-U-mode counter in the retirement message.
 
 ---
 
-# Part 5 — The limit of the isolation, stated plainly
+# Part 5 — The Limit of the Isolation, Stated Plainly
 
 **Read this before citing the project as a protected-mode example.**
 
@@ -654,7 +654,7 @@ M-mode.
 
 Two of them are what this project rests on:
 
-| entry | range | permissions |
+| Entry | Range | Permissions |
 |---|---|---|
 | 4 | `[SOC_IRAM_LOW, _iram_text_end)` | R+X, locked |
 | 5 | `[_iram_text_end, SOC_DRAM_HIGH)` | R+W, locked |
@@ -671,7 +671,7 @@ just its own. So:
   It watches `sp`, not accesses. A user that leaves `sp` alone and writes through
   a wild pointer is caught by neither, which is what `user_range_ok()` is for.
 
-### Reading the PMP configuration
+### Reading the PMP Configuration
 
 The boot report prints the four `pmpcfg` words rather than describing them, so
 you can check the above rather than take it on trust:
@@ -682,14 +682,14 @@ KERNEL: pmpcfg 0=809d9b9b 1=8d808b8d 2=80000089 3=9b8b8d8b
 
 Each word packs four entries, one byte each, entry 0 in the low byte:
 
-| bit | field | values |
+| Bit | Field | Values |
 |---|---|---|
-| 7 | `L` | lock. Once set, the entry cannot be changed, and it applies to M-mode too |
-| 6:5 | — | reserved, zero |
-| 4:3 | `A` | address matching: `0`=OFF, `1`=TOR, `2`=NA4, `3`=NAPOT |
-| 2 | `X` | execute |
-| 1 | `W` | write |
-| 0 | `R` | read |
+| 7 | `L` | Lock. Once set, the entry cannot be changed, and it applies to M-mode too |
+| 6:5 | — | Reserved, zero |
+| 4:3 | `A` | Address matching: `0`=OFF, `1`=TOR, `2`=NA4, `3`=NAPOT |
+| 2 | `X` | Execute |
+| 1 | `W` | Write |
+| 0 | `R` | Read |
 
 **`TOR` means "top of range", and it takes its base from the *previous* entry's
 `pmpaddr`.** That is why entry 3 exists at all: it is set to `SOC_IRAM_LOW` with
@@ -699,24 +699,24 @@ is how the two rows in the table above get their boundaries.
 
 Decoding the words above gives this board's actual configuration:
 
-| entry | byte | L | A | perms | |
+| Entry | Byte | L | A | Perms |  |
 |---|---|---|---|---|---|
-| 0 | `9b` | 1 | NAPOT | RW | |
-| 1 | `9b` | 1 | NAPOT | RW | |
-| 2 | `9d` | 1 | NAPOT | RX | |
-| 3 | `80` | 1 | OFF | — | base for entry 4 |
-| 4 | `8d` | 1 | TOR | RX | **the U-mode execute grant** |
-| 5 | `8b` | 1 | TOR | RW | **the U-mode data grant — all of DRAM** |
-| 6 | `80` | 1 | OFF | — | base for entry 7 |
-| 7 | `8d` | 1 | TOR | RX | |
-| 8 | `89` | 1 | TOR | R | |
-| 9 | `00` | **0** | OFF | — | never programmed |
-| 10 | `00` | **0** | OFF | — | never programmed |
-| 11 | `80` | 1 | OFF | — | base for entry 12 |
-| 12 | `8b` | 1 | TOR | RW | |
-| 13 | `8d` | 1 | TOR | RX | |
-| 14 | `8b` | 1 | TOR | RW | |
-| 15 | `9b` | 1 | NAPOT | RW | |
+| 0 | `9b` | 1 | NAPOT | RW |  |
+| 1 | `9b` | 1 | NAPOT | RW |  |
+| 2 | `9d` | 1 | NAPOT | RX |  |
+| 3 | `80` | 1 | OFF | — | Base for entry 4 |
+| 4 | `8d` | 1 | TOR | RX | **The U-mode execute grant** |
+| 5 | `8b` | 1 | TOR | RW | **The U-mode data grant — all of DRAM** |
+| 6 | `80` | 1 | OFF | — | Base for entry 7 |
+| 7 | `8d` | 1 | TOR | RX |  |
+| 8 | `89` | 1 | TOR | R |  |
+| 9 | `00` | **0** | OFF | — | Never programmed |
+| 10 | `00` | **0** | OFF | — | Never programmed |
+| 11 | `80` | 1 | OFF | — | Base for entry 12 |
+| 12 | `8b` | 1 | TOR | RW |  |
+| 13 | `8d` | 1 | TOR | RX |  |
+| 14 | `8b` | 1 | TOR | RW |  |
+| 15 | `9b` | 1 | NAPOT | RW |  |
 
 So "all sixteen locked" would be too strong: **entries 9 and 10 are unlocked and
 unprogrammed** on this configuration. IDF only sets them in its external-RAM
@@ -740,7 +740,7 @@ permissions and matching modes but not the boundaries. Those come from
 `components/esp_hw_support/port/esp32p4/cpu_region_protect.c` in your IDF
 checkout, which is the file to read alongside this table.
 
-### Closing the gap
+### Closing the Gap
 
 Closing it means stopping the entries being locked in the first place. The
 NuttX `BUILD_PROTECTED` port for this board does exactly that: it drops IDF's
@@ -756,19 +756,19 @@ before drawing conclusions about what this demonstrates.
 
 # Reference
 
-## The files
+## The Files
 
-| file | privilege | what it is |
+| File | Privilege | What It Is |
 |---|---|---|
-| `main/kernel_main.c` | M | the kernel. Boot report, the slot table, the host loop, the syscall dispatcher, user-pointer validation |
+| `main/kernel_main.c` | M | The kernel. Boot report, the slot table, the host loop, the syscall dispatcher, user-pointer validation |
 | `main/umode.S` | M | `umode_enter()`, the private trap vector, the CLIC vector table |
-| `main/user_main.c` | **U** | the user application. No library calls, no writable statics, compiled into IRAM |
-| `main/user_syscall.S` | **U** | the `ecall` stubs and the exit trampoline |
-| `main/umode.h` | both | the context layout, shared with `umode.S` as byte offsets |
-| `main/syscall.h` | both | the kernel/user ABI |
-| `probe/` | — | the earlier `mret`-to-U-mode experiment ([README](probe/README.md)) |
+| `main/user_main.c` | **U** | The user application. No library calls, no writable statics, compiled into IRAM |
+| `main/user_syscall.S` | **U** | The `ecall` stubs and the exit trampoline |
+| `main/umode.h` | Both | The context layout, shared with `umode.S` as byte offsets |
+| `main/syscall.h` | Both | The kernel/user ABI |
+| `probe/` | — | The earlier `mret`-to-U-mode experiment ([README](probe/README.md)) |
 
-## Build and run
+## Build and Run
 
 ```bash
 ./build.sh          # configure for esp32p4 if needed, then build
@@ -786,7 +786,7 @@ shell will not expand; `scripts/idf-env.sh` asks it for its environment with
 
 Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
 
-## Gotchas worth keeping
+## Gotchas Worth Keeping
 
 - **Chip revision.** IDF defaults to a minimum of v3.1 and the bootloader
   refuses to flash on v1.0 silicon (`requires chip revision in range [v3.1 -
@@ -821,19 +821,19 @@ Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
   `kernel_main.c` `_Static_assert`s it for all five registers `umode.S`
   addresses by hand, and `umode.S` carries an `#error` if it changes.
 
-## Further reading
+## Further Reading
 
 Annotated with what in *this* project each one explains, because a spec index is
 not much use to someone holding a specific question.
 
 ### RISC-V
 
-| document | what to look up in it |
+| Document | What to Look up in It |
 |---|---|
-| [RISC-V International — specifications index](https://riscv.org/technical/specifications/) | the ratified specs, and which are ratified at all. Start here to check whether something is standard |
-| [`riscv/riscv-isa-manual`](https://github.com/riscv/riscv-isa-manual) — source | the ISA and **privileged** manuals. The privileged manual is the reference for `mret`, `mstatus.MPP`/`MPIE`, `mcause`, `mtval`, `mepc`, `mscratch`, `ecall` and the PMP — every mechanism in [Part 1](#part-1--the-concepts) and [3.3](#33-mcause-aliases-mstatusmpp) |
-| [ratified PDFs](https://github.com/riscv/riscv-isa-manual/releases) | built copies of the above, if you would rather not render AsciiDoc |
-| [`github.com/riscv`](https://github.com/riscv) | every other spec repo, for anything not in the two manuals |
+| [RISC-V International — specifications index](https://riscv.org/technical/specifications/) | The ratified specs, and which are ratified at all. Start here to check whether something is standard |
+| [`riscv/riscv-isa-manual`](https://github.com/riscv/riscv-isa-manual) — source | The ISA and **privileged** manuals. The privileged manual is the reference for `mret`, `mstatus.MPP`/`MPIE`, `mcause`, `mtval`, `mepc`, `mscratch`, `ecall` and the PMP — every mechanism in [Part 1](#part-1--the-concepts) and [3.3](#33-mcause-aliases-mstatusmpp) |
+| [Ratified PDFs](https://github.com/riscv/riscv-isa-manual/releases) | Built copies of the above, if you would rather not render AsciiDoc |
+| [`github.com/riscv`](https://github.com/riscv) | Every other spec repo, for anything not in the two manuals |
 
 The PMP, including the `L` lock bit, the `A` matching modes, the
 lowest-numbered-match-wins priority rule and why clearing a lock needs
@@ -845,11 +845,11 @@ had to be.
 
 ### CLIC
 
-| document | what to look up in it |
+| Document | What to Look up in It |
 |---|---|
-| [`riscv/riscv-fast-interrupt`](https://github.com/riscv/riscv-fast-interrupt) | the CLIC proposal: `mtvt`, `mintstatus.mil`, `mcause.mpil`, interrupt levels, and the vectored-entry model the private vector in `umode.S` implements |
-| [built PDF releases](https://github.com/riscv/riscv-fast-interrupt/releases) | rendered copies (v0.20 at the time of writing) |
-| [spec source](https://github.com/riscv/riscv-fast-interrupt/tree/master/src) | the AsciiDoc, if you want to diff versions |
+| [`riscv/riscv-fast-interrupt`](https://github.com/riscv/riscv-fast-interrupt) | The CLIC proposal: `mtvt`, `mintstatus.mil`, `mcause.mpil`, interrupt levels, and the vectored-entry model the private vector in `umode.S` implements |
+| [Built PDF releases](https://github.com/riscv/riscv-fast-interrupt/releases) | Rendered copies (v0.20 at the time of writing) |
+| [Spec source](https://github.com/riscv/riscv-fast-interrupt/tree/master/src) | The AsciiDoc, if you want to diff versions |
 
 **Read the status line on that repo before treating it as authority.** It is
 titled a *proposal* for a Core-Local Interrupt Controller, and it is not a
@@ -863,11 +863,11 @@ silicon wins and the TRM below is the tie-breaker.
 
 ### ESP32-P4
 
-| document | what to look up in it |
+| Document | What to Look up in It |
 |---|---|
-| [ESP32-P4 Technical Reference Manual](https://www.espressif.com/sites/default/files/documentation/esp32-p4_technical_reference_manual_en.pdf) | the authority when the RISC-V documents and the hardware disagree. The interrupt matrix and its per-core routing ([3.5](#35-one-interrupt-source-two-monitors)), the CLIC's memory-mapped registers, and the debug assist peripheral's per-core register blocks and SP-monitor semantics ([3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch)) |
-| [ESP32-P4 Datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-p4_datasheet_en.pdf) | part numbering, revisions, and the memory map the PMP entries in [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly) are cut from |
-| [ESP-IDF v5.5.4 — ESP32-P4](https://docs.espressif.com/projects/esp-idf/en/v5.5.4/esp32p4/index.html) | the exact IDF version this tree is built against |
+| [ESP32-P4 Technical Reference Manual](https://www.espressif.com/sites/default/files/documentation/esp32-p4_technical_reference_manual_en.pdf) | The authority when the RISC-V documents and the hardware disagree. The interrupt matrix and its per-core routing ([3.5](#35-one-interrupt-source-two-monitors)), the CLIC's memory-mapped registers, and the debug assist peripheral's per-core register blocks and SP-monitor semantics ([3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch)) |
+| [ESP32-P4 Datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-p4_datasheet_en.pdf) | Part numbering, revisions, and the memory map the PMP entries in [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly) are cut from |
+| [ESP-IDF v5.5.4 — ESP32-P4](https://docs.espressif.com/projects/esp-idf/en/v5.5.4/esp32p4/index.html) | The exact IDF version this tree is built against |
 
 Two ESP-IDF sources are quoted directly in the code and are worth opening
 alongside it, in your local IDF checkout rather than online, so the version
@@ -884,25 +884,25 @@ matches:
 
 ## Glossary
 
-| term | meaning |
+| Term | Meaning |
 |---|---|
-| **hart** | hardware thread — one RISC-V core. The P4 has two |
-| **M-mode** | machine mode. Full privilege. ESP-IDF and FreeRTOS run here |
-| **U-mode** | user mode. Lowest privilege. No CSRs, no privileged instructions |
-| **`ecall`** | the instruction that traps from a lower privilege to a higher one. The only way from U to M |
-| **`mret`** | return from a trap. Also how the kernel *enters* U-mode, by setting `MPP=U` first |
-| **`mcause`** | why the trap happened. On this SoC it also packs previous privilege, interrupt-enable and interrupt level |
-| **`mtval`** | trap value — for an illegal instruction, the instruction word itself |
-| **`mepc`** | the PC the trap interrupted, and where `mret` returns to |
-| **`mtvec` / `mtvt`** | trap vector base / CLIC vector table base. Per-hart |
-| **`mscratch`** | a scratch CSR, unused by ESP-IDF here, used to carry the context pointer into the trap vector |
-| **CLIC** | the P4's core-local interrupt controller. Vectored, with an interrupt *level* rather than a simple enable |
-| **CLIC threshold** | the only thing that masks interrupts in U-mode, since `mstatus.MIE` does not apply there |
-| **PMP** | physical memory protection. Region-based permissions that apply to U-mode, and to M-mode when locked |
-| **Smepmp** | the RISC-V extension that would allow clearing PMP lock bits. **Not** implemented on the P4 |
-| **assist_debug** | the ESP32-P4 debug assist peripheral. Its SP monitor is what ESP-IDF's hardware stack guard uses |
-| **window** | one entry into and return from U-mode: `umode_enter()` to the trap that ends it |
-| **arena** | one user's memory — its stack and data. One per slot |
+| **hart** | Hardware thread — one RISC-V core. The P4 has two |
+| **M-mode** | Machine mode. Full privilege. ESP-IDF and FreeRTOS run here |
+| **U-mode** | User mode. Lowest privilege. No CSRs, no privileged instructions |
+| **`ecall`** | The instruction that traps from a lower privilege to a higher one. The only way from U to M |
+| **`mret`** | Return from a trap. Also how the kernel *enters* U-mode, by setting `MPP=U` first |
+| **`mcause`** | Why the trap happened. On this SoC it also packs previous privilege, interrupt-enable and interrupt level |
+| **`mtval`** | Trap value — for an illegal instruction, the instruction word itself |
+| **`mepc`** | The PC the trap interrupted, and where `mret` returns to |
+| **`mtvec` / `mtvt`** | Trap vector base / CLIC vector table base. Per-hart |
+| **`mscratch`** | A scratch CSR, unused by ESP-IDF here, used to carry the context pointer into the trap vector |
+| **CLIC** | The P4's core-local interrupt controller. Vectored, with an interrupt *level* rather than a simple enable |
+| **CLIC threshold** | The only thing that masks interrupts in U-mode, since `mstatus.MIE` does not apply there |
+| **PMP** | Physical memory protection. Region-based permissions that apply to U-mode, and to M-mode when locked |
+| **Smepmp** | The RISC-V extension that would allow clearing PMP lock bits. **Not** implemented on the P4 |
+| **assist_debug** | The ESP32-P4 debug assist peripheral. Its SP monitor is what ESP-IDF's hardware stack guard uses |
+| **window** | One entry into and return from U-mode: `umode_enter()` to the trap that ends it |
+| **arena** | One user's memory — its stack and data. One per slot |
 | **slot** | `user_slot_t`: everything one U-mode window owns |
 
 ## Status
