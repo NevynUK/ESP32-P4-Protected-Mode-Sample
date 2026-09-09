@@ -534,9 +534,9 @@ static bool syscall_dispatch(user_slot_t *u)
                 if (len < 0)
                 {
                     kprintf(
-                        "KERNEL: SYS_PUTS rejected: msg=%08lx is not a "
-                        "terminated string in the user arena\n",
-                        (unsigned long) arg0);
+                        "KERNEL: %s: SYS_PUTS rejected: msg=%08lx is not a "
+                        "terminated string in its arena\n",
+                        u->name, (unsigned long) arg0);
                     ret = SYS_ERR_FAULT;
                     break;
                 }
