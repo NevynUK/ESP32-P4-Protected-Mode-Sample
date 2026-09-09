@@ -30,7 +30,8 @@ It is written to be worked through, not skimmed. The order is deliberate:
    have captured output so you can check your answer.
 6. **[Part 5: the limit of the isolation](#part-5--the-limit-of-the-isolation-stated-plainly)**
    — what this does *not* protect, and why.
-7. **[Reference](#reference)** — syscall table, files, build, gotchas, glossary.
+7. **[Reference](#reference)** — syscall table, files, build, gotchas, further
+   reading, glossary.
 
 If you only read one section, read **Part 3**.
 
@@ -722,7 +723,11 @@ Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
   can be inspected with an observe-only JTAG halt rather than being reset away.
 
 - **Non-standard CLIC CSRs.** `mtvt` is `0x307` and `mintstatus` is `0x346`
-  rather than the ratified `0xfb1`.
+  rather than the `0xfb1` the CLIC specification gives it. Note that CLIC is a
+  *proposal*, not a ratified extension — see
+  [further reading](#further-reading) — so "non-standard" here means the P4
+  disagrees with an unratified document, in one CSR number out of the two it
+  takes from it.
 
 - **`mtvt` must be 256-byte aligned and `mtvec.base` 64-byte aligned**, and
   `mtvec`'s low bits carry CLIC mode 3. Both are handled by `.balign` directives
@@ -741,6 +746,65 @@ Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
 - **The assist_debug per-core stride is assumed to be `0x80`.**
   `kernel_main.c` `_Static_assert`s it for all five registers `umode.S`
   addresses by hand, and `umode.S` carries an `#error` if it changes.
+
+## Further reading
+
+Annotated with what in *this* project each one explains, because a spec index is
+not much use to someone holding a specific question.
+
+### RISC-V
+
+| document | what to look up in it |
+|---|---|
+| [RISC-V International — specifications index](https://riscv.org/technical/specifications/) | the ratified specs, and which are ratified at all. Start here to check whether something is standard |
+| [`riscv/riscv-isa-manual`](https://github.com/riscv/riscv-isa-manual) — source | the ISA and **privileged** manuals. The privileged manual is the reference for `mret`, `mstatus.MPP`/`MPIE`, `mcause`, `mtval`, `mepc`, `mscratch`, `ecall` and the PMP — every mechanism in [Part 1](#part-1--the-concepts) and [3.3](#33-mcause-aliases-mstatusmpp) |
+| [ratified PDFs](https://github.com/riscv/riscv-isa-manual/releases) | built copies of the above, if you would rather not render AsciiDoc |
+| [`github.com/riscv`](https://github.com/riscv) | every other spec repo, for anything not in the two manuals |
+
+The PMP, including the `L` lock bit and why clearing it needs **Smepmp**, is in
+the privileged manual's physical-memory-protection chapter. That is the
+background to [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly), and
+worth reading before deciding this project's memory isolation is weaker than it
+had to be.
+
+### CLIC
+
+| document | what to look up in it |
+|---|---|
+| [`riscv/riscv-fast-interrupt`](https://github.com/riscv/riscv-fast-interrupt) | the CLIC proposal: `mtvt`, `mintstatus.mil`, `mcause.mpil`, interrupt levels, and the vectored-entry model the private vector in `umode.S` implements |
+| [built PDF releases](https://github.com/riscv/riscv-fast-interrupt/releases) | rendered copies (v0.20 at the time of writing) |
+| [spec source](https://github.com/riscv/riscv-fast-interrupt/tree/master/src) | the AsciiDoc, if you want to diff versions |
+
+**Read the status line on that repo before treating it as authority.** It is
+titled a *proposal* for a Core-Local Interrupt Controller, and it is not a
+ratified RISC-V extension. That is the honest explanation for a good deal of
+what [Part 3](#part-3--five-things-that-do-not-work-the-obvious-way) documents:
+the P4 implements a moving target, so `mintstatus` sits at `0x346` rather than
+`0xfb1`, the interrupt threshold is a memory-mapped register rather than a CSR,
+and `mcause` carries fields ([3.3](#33-mcause-aliases-mstatusmpp)) that no
+ratified document describes. When silicon and this document disagree, the
+silicon wins and the TRM below is the tie-breaker.
+
+### ESP32-P4
+
+| document | what to look up in it |
+|---|---|
+| [ESP32-P4 Technical Reference Manual](https://www.espressif.com/sites/default/files/documentation/esp32-p4_technical_reference_manual_en.pdf) | the authority when the RISC-V documents and the hardware disagree. The interrupt matrix and its per-core routing ([3.5](#35-one-interrupt-source-two-monitors)), the CLIC's memory-mapped registers, and the debug assist peripheral's per-core register blocks and SP-monitor semantics ([3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch)) |
+| [ESP32-P4 Datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-p4_datasheet_en.pdf) | part numbering, revisions, and the memory map the PMP entries in [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly) are cut from |
+| [ESP-IDF v5.5.4 — ESP32-P4](https://docs.espressif.com/projects/esp-idf/en/v5.5.4/esp32p4/index.html) | the exact IDF version this tree is built against |
+
+Two ESP-IDF sources are quoted directly in the code and are worth opening
+alongside it, in your local IDF checkout rather than online, so the version
+matches:
+
+- `components/esp_system/port/include/private/esp_private/hw_stack_guard.h` —
+  the stack-guard macros `umode.S` uses, and the `SOC_CPU_CORES_NUM` gate that
+  decides whether they dispatch on `mhartid`
+  ([1.4](#14-one-window-per-core-and-what-that-forces));
+- `components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S` — how the port
+  itself arms the guard on every interrupt exit, which is what
+  [3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch) has to work
+  around.
 
 ## Glossary
 
