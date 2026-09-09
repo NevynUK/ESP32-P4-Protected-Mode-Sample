@@ -79,9 +79,9 @@
  *   - user_ctx_init() has to fill in u_sp_min/u_sp_max.  umode_enter() will
  *     happily install whatever is there, including zeros.
  *
- *   - kernel_main() has to un-route the assist_debug source on core 1.  The
- *     CLIC threshold umode.S raises masks core 0 only, and the source is
- *     shared; see the comment at the call.
+ *   - kernel_main() has to un-route the assist_debug source on every core but
+ *     DEMO_CORE.  The CLIC threshold umode.S raises masks its own core only,
+ *     and the source is shared; see the comment at the call.
  *
  * The check is made before the trap cause because the two are independent: the
  * user overflows its stack at one instruction and reaches the kernel at a
@@ -142,6 +142,7 @@
 
 #include "esp_attr.h"
 #include "esp_rom_sys.h"
+#include "soc/assist_debug_reg.h"
 #include "soc/clic_reg.h"
 #include "soc/interrupts.h"
 #include "soc/soc.h"
@@ -168,6 +169,14 @@
 /* mtvec is a per-hart CSR and umode_enter() borrows it for the duration of the
  * window, so the host task is pinned.  The kernel task is pinned alongside it
  * only to keep the console output in a predictable order.
+ *
+ * WHICH core it is pinned to is now free: set this to any core the SoC has and
+ * everything that has to follow it does.  umode.S selects the current core's
+ * assist_debug block at run time, and the un-route in kernel_main() below
+ * covers every core except this one.  What is still required is that the window
+ * stay pinned to ONE core for its whole length -- umode_enter() snapshots
+ * per-hart CSRs before it masks interrupts, so an unpinned host task could be
+ * migrated between the snapshot and the restore.
  */
 
 #define DEMO_CORE 0
@@ -238,19 +247,39 @@ _Static_assert(offsetof(umode_ctx_t, sp_fired) == UCTX_SP_FIRED, "umode_ctx_t.sp
 _Static_assert(offsetof(umode_ctx_t, sp_pc) == UCTX_SP_PC, "umode_ctx_t.sp_pc moved");
 _Static_assert(sizeof(umode_ctx_t) == UCTX_SIZE, "umode_ctx_t size changed");
 
-/* umode.S reaches the assist_debug stack-guard registers through ESP-IDF's
- * _CUR_CORE macros, which collapse to their _CPU0 variants in assembly:
- * SOC_CPU_CORES_NUM is not defined there, so the "which core am I?" branch is
- * preprocessed away.  IDF's own portasm.S has the same property.  That makes
- * the whole guard hand-over correct only while the U-mode window runs on core
- * 0, which is a property of this file, not of umode.S -- so assert it here.
+/* umode.S reads five assist_debug registers with plain loads and stores, and
+ * hw_stack_guard.h names only the CORE_0 copies as addresses.  It reaches the
+ * current core's copy by adding mhartid * ASSIST_DEBUG_CORE_STRIDE, which is
+ * correct only while the per-core blocks are evenly spaced and that spacing is
+ * the shift UMODE_CORE_OFF applies.  Neither is something umode.S can check
+ * for itself, so check all five here.
  */
 
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
-_Static_assert(
-    DEMO_CORE == 0, "umode.S drives the CORE_0 assist_debug registers "
-                    "unconditionally; the U-mode window must run on core 0");
+
+#define ASSIST_DEBUG_CORE_STRIDE (ASSIST_DEBUG_CORE_1_INTR_ENA_REG - ASSIST_DEBUG_CORE_0_INTR_ENA_REG)
+
+_Static_assert(ASSIST_DEBUG_CORE_STRIDE == 0x80, "UMODE_CORE_OFF in umode.S shifts mhartid by 7 to reach "
+                                                 "the current core's assist_debug block");
+
+#define UMODE_STRIDE_OK(reg) \
+  (ASSIST_DEBUG_CORE_1_##reg - ASSIST_DEBUG_CORE_0_##reg == ASSIST_DEBUG_CORE_STRIDE)
+
+_Static_assert(UMODE_STRIDE_OK(INTR_RAW_REG), "assist_debug INTR_RAW is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(INTR_CLR_REG), "assist_debug INTR_CLR is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(SP_MIN_REG), "assist_debug SP_MIN is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(SP_MAX_REG), "assist_debug SP_MAX is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(SP_PC_REG), "assist_debug SP_PC is not one stride apart per core");
+
+/* The stride only means anything if there is more than one block to stride
+ * between; DEMO_CORE is range-checked against the same number below.
+ */
+
+_Static_assert(SOC_CPU_CORES_NUM == 2, "the assist_debug stride arithmetic assumes exactly two cores");
+
 #endif
+
+_Static_assert(DEMO_CORE >= 0 && DEMO_CORE < SOC_CPU_CORES_NUM, "DEMO_CORE is not a core this SoC has");
 
 /* umode.S cannot include soc/clic_reg.h, so it carries its own copy of the
  * CLIC threshold address.  Keep the two honest.
@@ -709,10 +738,11 @@ static void boot_report(void)
     kprintf("KERNEL: user arena %08lx..%08lx (%u bytes, stack and data)\n", (unsigned long) arena, (unsigned long) (arena + USER_ARENA_SIZE), (unsigned) USER_ARENA_SIZE);
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
     kprintf("KERNEL: hardware stack guard follows the window on to that range\n");
+    kprintf("KERNEL: the window runs on core %d, and reads that core's assist_debug block\n", DEMO_CORE);
     #if SOC_CPU_CORES_NUM > 1
     kprintf(
-        "KERNEL: core 1 un-routed from the shared assist_debug source, so it\n"
-        "KERNEL:   no longer reports stack guard faults of its own\n");
+        "KERNEL: the other core is un-routed from the shared assist_debug\n"
+        "KERNEL:   source, so it no longer reports stack guard faults of its own\n");
     #endif
 #else
     kprintf("KERNEL: hardware stack guard is disabled in this build\n");
@@ -738,33 +768,41 @@ void kernel_main(void)
 
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD && SOC_CPU_CORES_NUM > 1
 
-    /* Take core 1 out of the assist_debug interrupt routing.
+    /* Take every core but DEMO_CORE out of the assist_debug interrupt routing.
      *
      * ETS_ASSIST_DEBUG_INTR_SOURCE is ONE source in the interrupt matrix, and
      * esp_hw_stack_guard_init() runs on every core, so each core routes it to
-     * its own ETS_ASSIST_DEBUG_INUM.  A violation on CORE 0's monitor is
-     * therefore delivered to core 1 as well -- where the CLIC threshold that
-     * umode.S raises for the window means nothing.  Core 1 takes it first, finds
-     * no explanation (core 0 clears the latch on the way out of the window) and
-     * panics the whole system with "ASSIST_DEBUG is not triggered BUT interrupt
-     * occurred!".  Measured: core 1 won that race every time.
+     * its own ETS_ASSIST_DEBUG_INUM.  A violation on DEMO_CORE's monitor is
+     * therefore delivered to the other cores as well -- where the CLIC
+     * threshold that umode.S raises for the window means nothing.  One of them
+     * takes it first, finds no explanation (DEMO_CORE clears the latch on the
+     * way out of the window) and panics the whole system with "ASSIST_DEBUG is
+     * not triggered BUT interrupt occurred!".  Measured: the other core won
+     * that race every time.
      *
      * The peripheral offers no way to separate the two -- on this SoC
-     * ASSIST_DEBUG_CORE_0_MONITOR_REG is #defined to
-     * ASSIST_DEBUG_CORE_0_INTR_ENA_REG, so the monitor enable and the interrupt
-     * enable are the same bits.  Un-routing the source on core 1 is the only
-     * lever, and it is one core 0 can pull, because the matrix is global.
+     * ASSIST_DEBUG_CORE_n_MONITOR_REG is #defined to
+     * ASSIST_DEBUG_CORE_n_INTR_ENA_REG, so the monitor enable and the interrupt
+     * enable are the same bits.  Un-routing the source is the only lever, and
+     * it is one DEMO_CORE can pull on another core's behalf, because the matrix
+     * is global.
      *
-     * The cost is stated in the boot report: the other core no longer reports
-     * stack guard violations of its own.  It runs nothing but ESP-IDF's idle and
-     * IPC tasks here.
+     * The cost is stated in the boot report: the other cores no longer report
+     * stack guard violations of their own.  They run nothing but ESP-IDF's idle
+     * and IPC tasks here.
      *
-     * Written as !DEMO_CORE rather than 1 so that it stays "the core the demo is
-     * NOT on" if DEMO_CORE ever moves.  Note that umode.S could not follow such
-     * a move on its own -- see the _Static_assert on DEMO_CORE above.
+     * The loop covers whichever cores are not DEMO_CORE, so this follows
+     * DEMO_CORE wherever it is set -- as does umode.S, which picks its
+     * assist_debug block from mhartid at run time.
      */
 
-    esp_rom_route_intr_matrix(!DEMO_CORE, ETS_ASSIST_DEBUG_INTR_SOURCE, ETS_INVALID_INUM);
+    for (int core = 0; core < SOC_CPU_CORES_NUM; core++)
+    {
+        if (core != DEMO_CORE)
+        {
+            esp_rom_route_intr_matrix(core, ETS_ASSIST_DEBUG_INTR_SOURCE, ETS_INVALID_INUM);
+        }
+    }
 
 #endif
 

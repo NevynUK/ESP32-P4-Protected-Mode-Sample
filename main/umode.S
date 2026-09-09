@@ -62,15 +62,22 @@
  * CMake change because esp_system/port/CMakeLists.txt puts include/private on
  * the PUBLIC side of its target_include_directories() list.
  *
- * ONE ASSUMPTION, and it is load-bearing: SOC_CPU_CORES_NUM is not defined in
- * assembly (soc_caps.h is behind that header's own __ASSEMBLER__ guard), so
- * the _CUR_CORE macros collapse to their _CPU0 variants and every register
- * named below is core 0's.  That is correct here only because kernel_main.c
- * pins both demo tasks to DEMO_CORE == 0 -- and it is exactly what IDF's own
- * portasm.S does, for the same reason.
+ * soc_caps.h comes FIRST, and it is load-bearing.  The _CUR_CORE macros in
+ * hw_stack_guard.h carry a real "which core am I?" dispatch on mhartid, but it
+ * is behind `#if SOC_CPU_CORES_NUM > 1` -- and hal/assist_debug_ll.h, the only
+ * thing hw_stack_guard.h includes, pulls soc_caps.h in on the C side of its own
+ * __ASSEMBLER__ guard.  Without the include below the constant is undefined
+ * here, the dispatch is preprocessed away, and every _CUR_CORE macro collapses
+ * to its _CPU0 variant.  IDF's own portasm.S includes soc_caps.h for exactly
+ * this reason, which is also why FreeRTOS keeps BOTH cores' bounds up to date
+ * and why the hand-over below can read the current core's back out again.
+ *
+ * soc_caps.h is safe in assembly: it has no #includes of its own and defines
+ * nothing but constants.
  */
 
 #include "sdkconfig.h"
+#include "soc/soc_caps.h"
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
 #  include "esp_private/hw_stack_guard.h"
 #endif
@@ -100,6 +107,47 @@
 #define KF_S9           48
 #define KF_S10          52
 #define KF_S11          56
+
+#if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
+
+/* The assist_debug registers this file reads directly -- INTR_RAW, INTR_CLR,
+ * SP_MIN, SP_MAX and SP_PC -- come in one block per core, and hw_stack_guard.h
+ * names only the CORE_0 copies as addresses (its own per-core handling is
+ * inside the macros, which is no help to a plain lw/sw).  The two blocks are a
+ * fixed stride apart, so the current core's copy is the CORE_0 address plus
+ * mhartid * that stride.  kernel_main.c _Static_asserts the stride against
+ * IDF's headers for all five registers, so a change there is a build error
+ * rather than a wrong address at run time.
+ */
+
+#define ASSIST_DEBUG_CORE_STRIDE \
+  (ASSIST_DEBUG_CORE_1_INTR_ENA_REG - ASSIST_DEBUG_CORE_0_INTR_ENA_REG)
+
+/* UMODE_CORE_OFF reg -- put mhartid * ASSIST_DEBUG_CORE_STRIDE in \reg, ready
+ * to be added to any CORE_0 address below.  Costs one csrr, so it is done once
+ * per block rather than once per access, and \reg has to stay live across the
+ * block: both call sites use t2, which no ESP_HW_STACK_GUARD macro touches.
+ */
+
+  .macro UMODE_CORE_OFF reg
+  csrr  \reg, mhartid
+#if ASSIST_DEBUG_CORE_STRIDE == 0x80
+  slli  \reg, \reg, 7
+#else
+#  error "ASSIST_DEBUG_CORE_STRIDE is no longer 0x80; fix the shift above"
+#endif
+  .endm
+
+/* UMODE_ASSIST_ADDR reg, core0_reg, off -- the current core's copy of
+ * \core0_reg into \reg, given an \off already loaded by UMODE_CORE_OFF.
+ */
+
+  .macro UMODE_ASSIST_ADDR reg, core0_reg, off
+  li    \reg, \core0_reg
+  add   \reg, \reg, \off
+  .endm
+
+#endif /* CONFIG_ESP_SYSTEM_HW_STACK_GUARD */
 
 /* Everything here runs in the trap path, so it goes in IRAM rather than in
  * flash where an evicted cache line would put a fetch inside the window.
@@ -243,23 +291,31 @@ umode_enter:
 
   ESP_HW_STACK_GUARD_MONITOR_STOP_CUR_CORE t0 t1
 
+  /* Which core's block of assist_debug registers the plain loads and stores
+   * below are to use.  Held in t2 for the rest of this block; a0 is the
+   * context and t0/t1/t3 are taken by the accesses themselves.
+   */
+
+  UMODE_CORE_OFF t2
+
   /* Clear any latched violation, so that what the trap vector reads on the way
    * out belongs to this window and nothing else.
    */
 
-  li    t0, ASSIST_DEBUG_CORE_0_INTR_CLR_REG
+  UMODE_ASSIST_ADDR t0, ASSIST_DEBUG_CORE_0_INTR_CLR_REG, t2
   li    t1, ASSIST_DEBUG_SP_SPILL_BITS
   sw    t1, 0(t0)
 
   /* Park the host task's bounds.  Read from the peripheral rather than passed
    * in, because FreeRTOS is the only thing that knows them and it writes them
-   * straight here on every context switch.
+   * straight here on every context switch -- for whichever core it is running
+   * on, since its portasm.S gets the real _CUR_CORE dispatch.
    */
 
-  li    t0, ASSIST_DEBUG_CORE_0_SP_MIN_REG
+  UMODE_ASSIST_ADDR t0, ASSIST_DEBUG_CORE_0_SP_MIN_REG, t2
   lw    t1, 0(t0)
   sw    t1, UCTX_K_SP_MIN(a0)
-  li    t0, ASSIST_DEBUG_CORE_0_SP_MAX_REG
+  UMODE_ASSIST_ADDR t0, ASSIST_DEBUG_CORE_0_SP_MAX_REG, t2
   lw    t1, 0(t0)
   sw    t1, UCTX_K_SP_MAX(a0)
 
@@ -464,6 +520,12 @@ umode_trap_entry:
 
   ESP_HW_STACK_GUARD_MONITOR_STOP_CUR_CORE t0 t1
 
+  /* Which core's assist_debug block to read, as on the way in.  Set before the
+   * beqz below, because the far side of that branch needs it too.
+   */
+
+  UMODE_CORE_OFF t2
+
   /* Did it fire?  If the user's sp left the arena the monitor latched it and
    * raised a level interrupt that the window's threshold has been holding off.
    * Left pending, it would be delivered the moment the mret below restores MIE
@@ -474,25 +536,26 @@ umode_trap_entry:
    * INTR_RAW is sticky, which is what makes this work at all: an excursion the
    * user put back before trapping is still here to be read.
    *
-   * The threshold raised above only masks THIS core.  The same violation is
-   * delivered to core 1, which would panic long before this code runs;
-   * kernel_main() un-routes the source on core 1 once at start-up to prevent
-   * that, and this block does not work without it.  There is no finer lever --
-   * on this SoC ASSIST_DEBUG_CORE_0_MONITOR_REG is #defined to
-   * ASSIST_DEBUG_CORE_0_INTR_ENA_REG, so the monitor enable and the interrupt
-   * enable are the same bits and cannot be separated.
+   * The threshold raised above only masks THIS core.  Both cores' monitors
+   * drive one interrupt-matrix source, so the same violation is delivered to
+   * every OTHER core as well, and any of them would panic long before this
+   * code runs; kernel_main() un-routes the source on all of them once at
+   * start-up to prevent that, and this block does not work without it.  There
+   * is no finer lever -- on this SoC ASSIST_DEBUG_CORE_n_MONITOR_REG is
+   * #defined to ASSIST_DEBUG_CORE_n_INTR_ENA_REG, so the monitor enable and
+   * the interrupt enable are the same bits and cannot be separated.
    */
 
-  li    t0, ASSIST_DEBUG_CORE_0_INTR_RAW_REG
+  UMODE_ASSIST_ADDR t0, ASSIST_DEBUG_CORE_0_INTR_RAW_REG, t2
   lw    t1, 0(t0)
   andi  t1, t1, ASSIST_DEBUG_SP_SPILL_BITS
   sw    t1, UCTX_SP_FIRED(a0)
   beqz  t1, .Lsp_ok
 
-  li    t0, ASSIST_DEBUG_CORE_0_SP_PC_REG
+  UMODE_ASSIST_ADDR t0, ASSIST_DEBUG_CORE_0_SP_PC_REG, t2
   lw    t1, 0(t0)
   sw    t1, UCTX_SP_PC(a0)
-  li    t0, ASSIST_DEBUG_CORE_0_INTR_CLR_REG
+  UMODE_ASSIST_ADDR t0, ASSIST_DEBUG_CORE_0_INTR_CLR_REG, t2
   li    t1, ASSIST_DEBUG_SP_SPILL_BITS
   sw    t1, 0(t0)
 
