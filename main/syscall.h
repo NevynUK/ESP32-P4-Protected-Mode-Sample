@@ -62,10 +62,16 @@ uint32_t u_syscall2(uint32_t nr, uint32_t arg0, uint32_t arg1);
 void u_exit_stub(void);
 
 /* The user application itself (user_main.c).  Never called directly by the
- * kernel -- its address is loaded into the user context's pc.
+ * kernel -- its address is loaded into the user context's pc, and its argument
+ * into the context's a0, by user_ctx_init().
+ *
+ * There is one copy of this code and more than one U-mode window running it at
+ * once, on different cores.  It must therefore hold no writable static state:
+ * `id` is how each instance tells itself apart, and everything else it needs
+ * lives on the user stack its own context points at.
  */
 
-void user_main(void);
+void user_main(uint32_t id);
 
 #endif /* __ASSEMBLER__ */
 #endif /* __SYSCALL_H */

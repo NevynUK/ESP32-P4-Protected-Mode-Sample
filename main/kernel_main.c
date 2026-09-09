@@ -79,9 +79,11 @@
  *   - user_ctx_init() has to fill in u_sp_min/u_sp_max.  umode_enter() will
  *     happily install whatever is there, including zeros.
  *
- *   - kernel_main() has to un-route the assist_debug source on core 1.  The
- *     CLIC threshold umode.S raises masks core 0 only, and the source is
- *     shared; see the comment at the call.
+ *   - kernel_main() has to un-route the assist_debug source on every core but
+ *     every core.  The CLIC threshold umode.S raises masks its own core only,
+ *     and the source is shared between the cores' monitors; with a window on
+ *     each core there is no core left that can safely keep it.  See the comment
+ *     at the call for what that costs.
  *
  * The check is made before the trap cause because the two are independent: the
  * user overflows its stack at one instruction and reaches the kernel at a
@@ -142,6 +144,7 @@
 
 #include "esp_attr.h"
 #include "esp_rom_sys.h"
+#include "soc/assist_debug_reg.h"
 #include "soc/clic_reg.h"
 #include "soc/interrupts.h"
 #include "soc/soc.h"
@@ -165,12 +168,24 @@
 #define KERNEL_TASK_PRIO 5
 #define USER_HOST_PRIO 5
 
-/* mtvec is a per-hart CSR and umode_enter() borrows it for the duration of the
- * window, so the host task is pinned.  The kernel task is pinned alongside it
- * only to keep the console output in a predictable order.
+/* One U-mode window per core, each with its own host task, its own arena and
+ * its own user context.  The two are independent all the way down: every CSR
+ * umode_enter() borrows is per-hart, umode.S picks its assist_debug block from
+ * mhartid, and umode.S has no writable data of its own -- its only sections are
+ * "ax" and "a" -- so both cores run the same window code re-entrantly.
+ *
+ * Each host task must stay pinned for the length of its window: umode_enter()
+ * snapshots per-hart CSRs before it masks interrupts, so an unpinned host task
+ * could be migrated between the snapshot and the restore.  WHICH core each one
+ * is pinned to is free.
+ *
+ * The kernel task is pinned to USER_CORE(0) only to keep the console output in
+ * a predictable order.
  */
 
-#define DEMO_CORE 0
+#define USER_SLOTS 2
+
+#define USER_CORE(n) (n)
 
 #define KERNEL_PERIOD_MS 1000
 
@@ -182,28 +197,72 @@
  * Private Data
  ****************************************************************************/
 
-/* The context umode_enter() runs.  Static rather than on the host task's
- * stack: the trap vector reaches it through mscratch and it must outlive
- * every path through the window.
+/* U-mode's memory: one arena per slot.  In .bss, so in DRAM, which is the
+ * region ESP-IDF's locked PMP entry 5 grants U-mode read+write on.
+ *
+ * Separate arrays rather than one two-dimensional one so that each is its own
+ * object with its own bounds, which is what user_range_ok() checks against.
  */
 
-static umode_ctx_t g_user_ctx;
+static uint8_t g_user0_arena[USER_ARENA_SIZE] __attribute__((aligned(16)));
+static uint8_t g_user1_arena[USER_ARENA_SIZE] __attribute__((aligned(16)));
 
-/* U-mode's memory.  In .bss, so in DRAM, which is the region ESP-IDF's locked
- * PMP entry 5 grants U-mode read+write on.
+/* Everything one U-mode window owns.
+ *
+ * The point of gathering it here rather than in file-scope globals is that
+ * TWO of these are now live at once, on two cores, running concurrently.  Any
+ * mutable state left shared between them would be a cross-core data race --
+ * and, in the case of the arena bounds, a hole: without a per-slot arena to
+ * check against, user 0 could hand the kernel a pointer into user 1's arena
+ * and user_range_ok() would wave it through.
+ *
+ * The console mutex below is the ONLY thing the two deliberately share.
  */
 
-static uint8_t g_user_arena[USER_ARENA_SIZE] __attribute__((aligned(16)));
+typedef struct
+{
+    const char *name;         /* what the kernel calls it in messages       */
+    uint32_t id;              /* passed to user_main() in a0                */
+    int core;                 /* the core its host task is pinned to        */
+    uint8_t *arena;           /* its U-mode memory: stack and data          */
+    uint32_t arena_size;
+
+    /* The context umode_enter() runs.  It lives here rather than on the host
+     * task's stack because the trap vector reaches it through mscratch and it
+     * must outlive every path through the window.
+     */
+
+    umode_ctx_t ctx;
+
+    volatile bool running;
+
+    /* Per-slot counters.  Two host tasks on two cores incrementing one
+     * counter is a data race with no lock in sight, so each keeps its own.
+     */
+
+    uint32_t syscalls;
+    uint32_t irqs_in_user;
+    bool umode_confirmed;
+} user_slot_t;
+
+static user_slot_t g_slots[USER_SLOTS] = {
+    {
+        .name = "user0",
+        .id = 0,
+        .core = USER_CORE(0),
+        .arena = g_user0_arena,
+        .arena_size = sizeof(g_user0_arena),
+    },
+    {
+        .name = "user1",
+        .id = 1,
+        .core = USER_CORE(1),
+        .arena = g_user1_arena,
+        .arena_size = sizeof(g_user1_arena),
+    },
+};
 
 static SemaphoreHandle_t g_console_mux;
-
-static volatile bool g_user_running;
-
-/* Counters for the boot-time sanity report */
-
-static uint32_t g_syscall_count;
-static uint32_t g_irq_in_user;
-static bool g_umode_confirmed;
 
 /* Placed by the linker at the end of IRAM text; the top of the region PMP
  * entry 4 grants U-mode execute on.
@@ -238,19 +297,46 @@ _Static_assert(offsetof(umode_ctx_t, sp_fired) == UCTX_SP_FIRED, "umode_ctx_t.sp
 _Static_assert(offsetof(umode_ctx_t, sp_pc) == UCTX_SP_PC, "umode_ctx_t.sp_pc moved");
 _Static_assert(sizeof(umode_ctx_t) == UCTX_SIZE, "umode_ctx_t size changed");
 
-/* umode.S reaches the assist_debug stack-guard registers through ESP-IDF's
- * _CUR_CORE macros, which collapse to their _CPU0 variants in assembly:
- * SOC_CPU_CORES_NUM is not defined there, so the "which core am I?" branch is
- * preprocessed away.  IDF's own portasm.S has the same property.  That makes
- * the whole guard hand-over correct only while the U-mode window runs on core
- * 0, which is a property of this file, not of umode.S -- so assert it here.
+/* umode.S reads five assist_debug registers with plain loads and stores, and
+ * hw_stack_guard.h names only the CORE_0 copies as addresses.  It reaches the
+ * current core's copy by adding mhartid * ASSIST_DEBUG_CORE_STRIDE, which is
+ * correct only while the per-core blocks are evenly spaced and that spacing is
+ * the shift UMODE_CORE_OFF applies.  Neither is something umode.S can check
+ * for itself, so check all five here.
  */
 
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
-_Static_assert(
-    DEMO_CORE == 0, "umode.S drives the CORE_0 assist_debug registers "
-                    "unconditionally; the U-mode window must run on core 0");
+
+#define ASSIST_DEBUG_CORE_STRIDE (ASSIST_DEBUG_CORE_1_INTR_ENA_REG - ASSIST_DEBUG_CORE_0_INTR_ENA_REG)
+
+_Static_assert(ASSIST_DEBUG_CORE_STRIDE == 0x80, "UMODE_CORE_OFF in umode.S shifts mhartid by 7 to reach "
+                                                 "the current core's assist_debug block");
+
+#define UMODE_STRIDE_OK(reg) \
+  (ASSIST_DEBUG_CORE_1_##reg - ASSIST_DEBUG_CORE_0_##reg == ASSIST_DEBUG_CORE_STRIDE)
+
+_Static_assert(UMODE_STRIDE_OK(INTR_RAW_REG), "assist_debug INTR_RAW is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(INTR_CLR_REG), "assist_debug INTR_CLR is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(SP_MIN_REG), "assist_debug SP_MIN is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(SP_MAX_REG), "assist_debug SP_MAX is not one stride apart per core");
+_Static_assert(UMODE_STRIDE_OK(SP_PC_REG), "assist_debug SP_PC is not one stride apart per core");
+
+/* The stride only means anything if there is more than one block to stride
+ * between, and this demo wants one window per core, so it needs exactly the
+ * two it knows how to address.
+ */
+
+_Static_assert(SOC_CPU_CORES_NUM == 2, "the assist_debug stride arithmetic assumes exactly two cores");
+
 #endif
+
+/* One window per core, and USER_CORE(n) == n, so the slot count and the core
+ * count have to agree.  If they ever stop agreeing, two slots would land on one
+ * core -- which is not itself unsafe, but it is not what this demo claims to
+ * show, and the un-route above would then be needlessly wide.
+ */
+
+_Static_assert(USER_SLOTS == SOC_CPU_CORES_NUM, "USER_SLOTS and SOC_CPU_CORES_NUM disagree; USER_CORE(n) maps one slot per core");
 
 /* umode.S cannot include soc/clic_reg.h, so it carries its own copy of the
  * CLIC threshold address.  Keep the two honest.
@@ -298,20 +384,27 @@ static void kwrite(const char *buf, uint32_t len)
  * Name: user_range_ok
  *
  * Description:
- *   Is [addr, addr + len) entirely inside the user arena?
+ *   Is [addr, addr + len) entirely inside THIS user's arena?
  *
  *   Every pointer that arrives from U-mode goes through here.  On this
  *   configuration IDF's locked PMP entry 5 would let U-mode hand us a pointer
  *   into kernel DRAM and the load would succeed, so this check -- not the
  *   hardware -- is what stops a user pointer being used to read the kernel.
  *
+ *   With more than one user the bounds have to come from the SLOT rather than
+ *   from a file-scope arena: entry 5 grants U-mode all of DRAM, so both arenas
+ *   are equally reachable from either user, and a check against "the" arena
+ *   would let user 0 read and write user 1's memory through the kernel.  The
+ *   two users are isolated from each other here, in software, for exactly the
+ *   same reason they are isolated from the kernel here rather than in the PMP.
+ *
  ****************************************************************************/
-static bool user_range_ok(uint32_t addr, uint32_t len)
+static bool user_range_ok(const user_slot_t *u, uint32_t addr, uint32_t len)
 {
-    const uintptr_t lo = (uintptr_t) g_user_arena;
-    const uintptr_t hi = lo + sizeof(g_user_arena);
+    const uintptr_t lo = (uintptr_t) u->arena;
+    const uintptr_t hi = lo + u->arena_size;
 
-    if (len > sizeof(g_user_arena))
+    if (len > u->arena_size)
     {
         return false;
     }
@@ -336,13 +429,13 @@ static bool user_range_ok(uint32_t addr, uint32_t len)
  *   max.  Returns -1 if the string is not terminated inside either.
  *
  ****************************************************************************/
-static int user_strlen(uint32_t addr, uint32_t max)
+static int user_strlen(const user_slot_t *u, uint32_t addr, uint32_t max)
 {
-    const uintptr_t hi = (uintptr_t) g_user_arena + sizeof(g_user_arena);
+    const uintptr_t hi = (uintptr_t) u->arena + u->arena_size;
     const char *p = (const char *) (uintptr_t) addr;
     uint32_t n;
 
-    if (!user_range_ok(addr, 1))
+    if (!user_range_ok(u, addr, 1))
     {
         return -1;
     }
@@ -378,26 +471,28 @@ static int user_strlen(uint32_t addr, uint32_t max)
  *   true to resume U-mode, false to retire the user context.
  *
  ****************************************************************************/
-static bool syscall_dispatch(umode_ctx_t *ctx)
+static bool syscall_dispatch(user_slot_t *u)
 {
+    umode_ctx_t *ctx = &u->ctx;
     const uint32_t nr = ctx->x[17];   /* a7 */
     const uint32_t arg0 = ctx->x[10]; /* a0 */
     const uint32_t arg1 = ctx->x[11]; /* a1 */
     uint32_t ret = 0;
 
-    g_syscall_count++;
+    u->syscalls++;
 
     /* The trap arrived as ECALL_U rather than ECALL_M, which is the system's
-     * own proof that the caller really was in U-mode.  Say so once.
+     * own proof that the caller really was in U-mode.  Said once per user, so
+     * the log carries the proof for BOTH of them independently.
      */
 
-    if (!g_umode_confirmed)
+    if (!u->umode_confirmed)
     {
-        g_umode_confirmed = true;
+        u->umode_confirmed = true;
         kprintf(
-            "KERNEL: first syscall arrived with mcause=%08lx (ECALL from "
-            "U-mode) -- user_main is running unprivileged\n",
-            (unsigned long) ctx->mcause);
+            "KERNEL: %s: first syscall arrived with mcause=%08lx (ECALL from "
+            "U-mode) on core %d -- user_main is running unprivileged\n",
+            u->name, (unsigned long) ctx->mcause, xPortGetCoreID());
     }
 
     switch (nr)
@@ -409,12 +504,12 @@ static bool syscall_dispatch(umode_ctx_t *ctx)
 
             /* The user's own console output: a counted buffer, emitted verbatim */
 
-            if (!user_range_ok(arg0, arg1))
+            if (!user_range_ok(u, arg0, arg1))
             {
                 kprintf(
-                    "KERNEL: SYS_WRITE rejected: buf=%08lx len=%lu outside "
-                    "the user arena\n",
-                    (unsigned long) arg0, (unsigned long) arg1);
+                    "KERNEL: %s: SYS_WRITE rejected: buf=%08lx len=%lu outside "
+                    "its arena\n",
+                    u->name, (unsigned long) arg0, (unsigned long) arg1);
                 ret = SYS_ERR_FAULT;
                 break;
             }
@@ -435,13 +530,13 @@ static bool syscall_dispatch(umode_ctx_t *ctx)
                 int len;
                 int i;
 
-                len = user_strlen(arg0, SYS_PUTS_MAX);
+                len = user_strlen(u, arg0, SYS_PUTS_MAX);
                 if (len < 0)
                 {
                     kprintf(
-                        "KERNEL: SYS_PUTS rejected: msg=%08lx is not a "
-                        "terminated string in the user arena\n",
-                        (unsigned long) arg0);
+                        "KERNEL: %s: SYS_PUTS rejected: msg=%08lx is not a "
+                        "terminated string in its arena\n",
+                        u->name, (unsigned long) arg0);
                     ret = SYS_ERR_FAULT;
                     break;
                 }
@@ -469,11 +564,11 @@ static bool syscall_dispatch(umode_ctx_t *ctx)
             break;
 
         case SYS_EXIT:
-            kprintf("KERNEL: user_main exited, status %lu\n", (unsigned long) arg0);
+            kprintf("KERNEL: %s: user_main exited, status %lu\n", u->name, (unsigned long) arg0);
             return false;
 
         default:
-            kprintf("KERNEL: unknown syscall %lu from pc=%08lx\n", (unsigned long) nr, (unsigned long) ctx->pc);
+            kprintf("KERNEL: %s: unknown syscall %lu from pc=%08lx\n", u->name, (unsigned long) nr, (unsigned long) ctx->pc);
             ret = SYS_ERR_BADNR;
             break;
     }
@@ -492,8 +587,9 @@ static bool syscall_dispatch(umode_ctx_t *ctx)
  *   killed; here it stops the context and says why.
  *
  ****************************************************************************/
-static void report_fault(const umode_ctx_t *ctx)
+static void report_fault(const user_slot_t *u)
 {
+    const umode_ctx_t *ctx = &u->ctx;
     const uint32_t code = ctx->mcause & MCAUSE_EXCCODE_MASK;
     const char *what;
 
@@ -531,7 +627,7 @@ static void report_fault(const umode_ctx_t *ctx)
             break;
     }
 
-    kprintf("KERNEL: user fault: %s\n", what);
+    kprintf("KERNEL: %s: user fault: %s\n", u->name, what);
     kprintf("KERNEL:   mcause=%08lx mtval=%08lx pc=%08lx sp=%08lx ra=%08lx\n", (unsigned long) ctx->mcause, (unsigned long) ctx->mtval, (unsigned long) ctx->pc, (unsigned long) ctx->x[2], (unsigned long) ctx->x[1]);
 }
 
@@ -545,9 +641,11 @@ static void report_fault(const umode_ctx_t *ctx)
  *   the way out so it can be attributed to the code that actually caused it.
  *
  ****************************************************************************/
-static void report_stack_fault(const umode_ctx_t *ctx)
+static void report_stack_fault(const user_slot_t *u)
 {
-    kprintf("KERNEL: user fault: stack pointer left the arena\n");
+    const umode_ctx_t *ctx = &u->ctx;
+
+    kprintf("KERNEL: %s: user fault: stack pointer left its arena\n", u->name);
     kprintf("KERNEL:   sp=%08lx allowed=%08lx..%08lx detected at pc=%08lx\n", (unsigned long) ctx->x[2], (unsigned long) ctx->u_sp_min, (unsigned long) ctx->u_sp_max, (unsigned long) ctx->sp_pc);
 }
 
@@ -562,9 +660,16 @@ static void report_stack_fault(const umode_ctx_t *ctx)
  *   gp and tp are deliberately left at zero here; umode.S does not load them,
  *   so U-mode inherits the kernel's and gp-relative addressing works.
  *
+ *   a0 carries the slot's id, so the one user_main() in the image can tell
+ *   which instance of itself it is.  Both users run that same code, from the
+ *   same IRAM, at the same time -- it holds no writable state, so its locals
+ *   live on whichever arena stack this context points at and the two
+ *   instances never touch each other.
+ *
  ****************************************************************************/
-static void user_ctx_init(umode_ctx_t *ctx)
+static void user_ctx_init(user_slot_t *u)
 {
+    umode_ctx_t *ctx = &u->ctx;
     uintptr_t stack_top;
     int i;
 
@@ -573,11 +678,12 @@ static void user_ctx_init(umode_ctx_t *ctx)
         ctx->x[i] = 0;
     }
 
-    stack_top = (uintptr_t) g_user_arena + sizeof(g_user_arena);
+    stack_top = (uintptr_t) u->arena + u->arena_size;
     stack_top &= ~(uintptr_t) 15;
 
     ctx->x[1] = (uint32_t) (uintptr_t) u_exit_stub; /* ra */
     ctx->x[2] = (uint32_t) stack_top;               /* sp */
+    ctx->x[10] = u->id;                             /* a0 = user_main's arg */
     ctx->pc = (uint32_t) (uintptr_t) user_main;
     ctx->mcause = 0;
     ctx->mtval = 0;
@@ -589,7 +695,7 @@ static void user_ctx_init(umode_ctx_t *ctx)
      * and is reported as a user fault rather than panicking the kernel.
      */
 
-    ctx->u_sp_min = (uint32_t) (uintptr_t) g_user_arena;
+    ctx->u_sp_min = (uint32_t) (uintptr_t) u->arena;
     ctx->u_sp_max = (uint32_t) stack_top;
     ctx->sp_fired = 0;
     ctx->sp_pc = 0;
@@ -626,30 +732,42 @@ static void kernel_task(void *arg)
  *   kernel-side host that runs it.  Each pass through the loop drops to
  *   U-mode, comes back on the next trap, and decides what to do about it.
  *
+ *   One of these runs per slot, on the slot's own core, at the same time.  The
+ *   loop below touches nothing outside its own slot except kprintf(), so the
+ *   two instances need no lock between them: the window itself is entirely
+ *   core-local, from the CSRs umode_enter() borrows to the assist_debug block
+ *   it picks out of mhartid.
+ *
  ****************************************************************************/
 static void user_host_task(void *arg)
 {
-    (void) arg;
+    user_slot_t *u = (user_slot_t *) arg;
 
-    user_ctx_init(&g_user_ctx);
+    /* The pin is a correctness requirement, not a preference -- see the
+     * comment on USER_CORE above -- so check it rather than assume it.
+     */
 
-    kprintf("KERNEL: entering U-mode at pc=%08lx sp=%08lx\n", (unsigned long) g_user_ctx.pc, (unsigned long) g_user_ctx.x[2]);
+    configASSERT(xPortGetCoreID() == u->core);
 
-    g_user_running = true;
+    user_ctx_init(u);
 
-    while (g_user_running)
+    kprintf("KERNEL: %s: entering U-mode on core %d at pc=%08lx sp=%08lx\n", u->name, xPortGetCoreID(), (unsigned long) u->ctx.pc, (unsigned long) u->ctx.x[2]);
+
+    u->running = true;
+
+    while (u->running)
     {
-        const uint32_t cause = umode_enter(&g_user_ctx);
+        const uint32_t cause = umode_enter(&u->ctx);
 
         /* Checked before the trap cause, because it is independent of it: the
          * user overflowed its stack at some point in the window and then got
          * here by whatever means -- very likely an ordinary syscall.
          */
 
-        if (g_user_ctx.sp_fired != 0)
+        if (u->ctx.sp_fired != 0)
         {
-            report_stack_fault(&g_user_ctx);
-            g_user_running = false;
+            report_stack_fault(u);
+            u->running = false;
             continue;
         }
 
@@ -660,24 +778,24 @@ static void user_host_task(void *arg)
              * serviced; pick U-mode up exactly where it was.
              */
 
-            g_irq_in_user++;
+            u->irqs_in_user++;
             continue;
         }
 
         if ((cause & MCAUSE_EXCCODE_MASK) == EXC_ECALL_U)
         {
-            g_user_running = syscall_dispatch(&g_user_ctx);
+            u->running = syscall_dispatch(u);
             continue;
         }
 
-        report_fault(&g_user_ctx);
-        g_user_running = false;
+        report_fault(u);
+        u->running = false;
     }
 
     kprintf(
-        "KERNEL: user context retired after %lu syscalls "
+        "KERNEL: %s: user context retired after %lu syscalls "
         "(%lu interrupts taken in U-mode)\n",
-        (unsigned long) g_syscall_count, (unsigned long) g_irq_in_user);
+        u->name, (unsigned long) u->syscalls, (unsigned long) u->irqs_in_user);
 
     vTaskDelete(NULL);
 }
@@ -695,7 +813,7 @@ static void boot_report(void)
 {
     const uintptr_t iram_end = (uintptr_t) &_iram_text_end;
     const uintptr_t user_pc = (uintptr_t) user_main;
-    const uintptr_t arena = (uintptr_t) g_user_arena;
+    int i;
 
     kprintf("\n");
     kprintf("=== ESP32-P4 protected-mode demo: M-mode kernel, U-mode user ===\n");
@@ -706,13 +824,30 @@ static void boot_report(void)
         "below it\n",
         (unsigned long) iram_end);
     kprintf("KERNEL: user text  %08lx (%s)\n", (unsigned long) user_pc, (user_pc >= SOC_IRAM_LOW && user_pc < iram_end) ? "inside the U-mode execute grant" : "OUTSIDE the grant -- U-mode will fault on the fetch");
-    kprintf("KERNEL: user arena %08lx..%08lx (%u bytes, stack and data)\n", (unsigned long) arena, (unsigned long) (arena + USER_ARENA_SIZE), (unsigned) USER_ARENA_SIZE);
+    kprintf("KERNEL: %d U-mode windows, one per core, sharing that one user_main:\n", USER_SLOTS);
+
+    for (i = 0; i < USER_SLOTS; i++)
+    {
+        const user_slot_t *u = &g_slots[i];
+        const uintptr_t lo = (uintptr_t) u->arena;
+
+        kprintf("KERNEL:   %s on core %d, arena %08lx..%08lx (%u bytes, stack and data)\n", u->name, u->core, (unsigned long) lo, (unsigned long) (lo + u->arena_size), (unsigned) u->arena_size);
+    }
+
+    kprintf(
+        "KERNEL: the arenas are separate objects and every syscall pointer is\n"
+        "KERNEL:   checked against the calling user's own bounds, so neither\n"
+        "KERNEL:   user can reach the other's memory through the kernel\n");
+
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
-    kprintf("KERNEL: hardware stack guard follows the window on to that range\n");
+    kprintf("KERNEL: hardware stack guard follows each window on to its own arena,\n");
+    kprintf("KERNEL:   read from the assist_debug block of the core it runs on\n");
     #if SOC_CPU_CORES_NUM > 1
     kprintf(
-        "KERNEL: core 1 un-routed from the shared assist_debug source, so it\n"
-        "KERNEL:   no longer reports stack guard faults of its own\n");
+        "KERNEL: COST: both cores are un-routed from the shared assist_debug\n"
+        "KERNEL:   source, so ESP-IDF no longer panics on an M-mode stack\n"
+        "KERNEL:   overflow on either core.  The monitors still latch, and each\n"
+        "KERNEL:   window still reports its own user's excursions.\n");
     #endif
 #else
     kprintf("KERNEL: hardware stack guard is disabled in this build\n");
@@ -738,41 +873,59 @@ void kernel_main(void)
 
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD && SOC_CPU_CORES_NUM > 1
 
-    /* Take core 1 out of the assist_debug interrupt routing.
+    /* Take EVERY core out of the assist_debug interrupt routing.
      *
      * ETS_ASSIST_DEBUG_INTR_SOURCE is ONE source in the interrupt matrix, and
      * esp_hw_stack_guard_init() runs on every core, so each core routes it to
-     * its own ETS_ASSIST_DEBUG_INUM.  A violation on CORE 0's monitor is
-     * therefore delivered to core 1 as well -- where the CLIC threshold that
-     * umode.S raises for the window means nothing.  Core 1 takes it first, finds
-     * no explanation (core 0 clears the latch on the way out of the window) and
-     * panics the whole system with "ASSIST_DEBUG is not triggered BUT interrupt
-     * occurred!".  Measured: core 1 won that race every time.
+     * its own ETS_ASSIST_DEBUG_INUM.  A violation on one core's monitor is
+     * therefore delivered to the other core as well -- where the CLIC threshold
+     * that umode.S raises for its own window means nothing.  The other core
+     * takes it, finds no explanation (the first core clears the latch on the way
+     * out of its window) and panics the whole system with "ASSIST_DEBUG is not
+     * triggered BUT interrupt occurred!".
      *
      * The peripheral offers no way to separate the two -- on this SoC
-     * ASSIST_DEBUG_CORE_0_MONITOR_REG is #defined to
-     * ASSIST_DEBUG_CORE_0_INTR_ENA_REG, so the monitor enable and the interrupt
-     * enable are the same bits.  Un-routing the source on core 1 is the only
-     * lever, and it is one core 0 can pull, because the matrix is global.
+     * ASSIST_DEBUG_CORE_n_MONITOR_REG is #defined to
+     * ASSIST_DEBUG_CORE_n_INTR_ENA_REG, so the monitor enable and the interrupt
+     * enable are the same bits.  Un-routing the source is the only lever.
      *
-     * The cost is stated in the boot report: the other core no longer reports
-     * stack guard violations of its own.  It runs nothing but ESP-IDF's idle and
-     * IPC tasks here.
+     * WITH ONE WINDOW this loop skipped the window's own core, so that core kept
+     * IDF's stack-guard panic for its M-mode stacks.  WITH A WINDOW ON EVERY
+     * CORE there is no core left to keep it: whichever core a violation is
+     * attributed to, some other core in a window has the source routed and will
+     * panic on it.  So the source comes out everywhere, and the price is stated
+     * plainly in the boot report -- ESP-IDF will no longer panic on an M-mode
+     * stack overflow on either core.
      *
-     * Written as !DEMO_CORE rather than 1 so that it stays "the core the demo is
-     * NOT on" if DEMO_CORE ever moves.  Note that umode.S could not follow such
-     * a move on its own -- see the _Static_assert on DEMO_CORE above.
+     * What is NOT lost: the monitors still run and still latch into their own
+     * INTR_RAW, and each window still reads its own core's latch on the way out,
+     * so a U-mode stack excursion is still caught and still attributed to the
+     * user that caused it.  The residue is that a kernel-side latch on a core is
+     * cleared by that core's next window entry, so an M-mode overflow there goes
+     * unreported rather than merely unpanicked.
      */
 
-    esp_rom_route_intr_matrix(!DEMO_CORE, ETS_ASSIST_DEBUG_INTR_SOURCE, ETS_INVALID_INUM);
+    for (int core = 0; core < SOC_CPU_CORES_NUM; core++)
+    {
+        esp_rom_route_intr_matrix(core, ETS_ASSIST_DEBUG_INTR_SOURCE, ETS_INVALID_INUM);
+    }
 
 #endif
 
     boot_report();
 
-    xTaskCreatePinnedToCore(kernel_task, "kernel", KERNEL_TASK_STACK, NULL, KERNEL_TASK_PRIO, NULL, DEMO_CORE);
+    xTaskCreatePinnedToCore(kernel_task, "kernel", KERNEL_TASK_STACK, NULL, KERNEL_TASK_PRIO, NULL, USER_CORE(0));
 
-    xTaskCreatePinnedToCore(user_host_task, "user_host", USER_HOST_STACK, NULL, USER_HOST_PRIO, NULL, DEMO_CORE);
+    /* One host task per slot, each pinned to its slot's core.  The task name
+     * carries the slot name so the two are distinguishable in any FreeRTOS
+     * introspection, and the slot is the task argument -- the host task reads
+     * everything it needs from it and touches no other slot.
+     */
+
+    for (int i = 0; i < USER_SLOTS; i++)
+    {
+        xTaskCreatePinnedToCore(user_host_task, g_slots[i].name, USER_HOST_STACK, &g_slots[i], USER_HOST_PRIO, NULL, g_slots[i].core);
+    }
 }
 
 /****************************************************************************
