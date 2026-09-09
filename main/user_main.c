@@ -26,6 +26,13 @@
  *
  * The one way out is u_syscall*(), and every externally visible thing this
  * application does goes through it.
+ *
+ * A fourth rule arrives with the second U-mode window: NO WRITABLE STATICS.
+ * Two cores run this same code at the same time, each in its own window with
+ * its own arena, so anything static and mutable here would be shared between
+ * them with no lock.  Every variable below is either a local -- on the calling
+ * window's own stack -- or const.  `id`, handed in by the kernel in a0, is how
+ * an instance knows which one it is.
  */
 
 #include <stdint.h>
@@ -52,6 +59,8 @@
 /****************************************************************************
  * Private Data
  ****************************************************************************/
+
+/* Read-only, so both instances share them safely. */
 
 static DRAM_ATTR const char g_user_prefix[] = "User ";
 static DRAM_ATTR const char g_syscall_prefix[] = "syscall ";
@@ -130,13 +139,19 @@ static IRAM_ATTR uint32_t u_append_u32(char *dst, uint32_t pos, uint32_t val)
  *   stealing a core.
  *
  ****************************************************************************/
-void IRAM_ATTR user_main(void)
+void IRAM_ATTR user_main(uint32_t id)
 {
     char msg[USER_MSG_MAX];
     uint32_t tick = 0;
     uint32_t user_n = 1;
     uint32_t syscall_n = 1;
     uint32_t pos;
+
+    /* Stagger the two instances by a tick, so that their output interleaves in
+     * the log rather than landing on the same second and reading as one.
+     */
+
+    u_syscall1(SYS_DELAY_MS, id * (USER_TICK_MS / 2));
 
     for (;;)
     {
@@ -151,6 +166,8 @@ void IRAM_ATTR user_main(void)
         if ((tick % USER_MSG_PERIOD) == 0)
         {
             pos = u_append(msg, 0, g_user_prefix);
+            pos = u_append_u32(msg, pos, id);
+            msg[pos++] = '.';
             pos = u_append_u32(msg, pos, user_n++);
             msg[pos++] = '\n';
             u_syscall2(SYS_WRITE, (uint32_t) (uintptr_t) msg, pos);
@@ -164,6 +181,8 @@ void IRAM_ATTR user_main(void)
         if ((tick % SYSCALL_PERIOD) == 0)
         {
             pos = u_append(msg, 0, g_syscall_prefix);
+            pos = u_append_u32(msg, pos, id);
+            msg[pos++] = '.';
             pos = u_append_u32(msg, pos, syscall_n++);
             msg[pos] = '\0';
             u_syscall1(SYS_PUTS, (uint32_t) (uintptr_t) msg);
