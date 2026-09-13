@@ -1,8 +1,9 @@
 # ESP32-P4: An ESP-IDF Application Split Across M-mode and U-mode
 
 A teaching reference. An ESP-IDF app whose kernel runs in machine mode and
-whose user applications run, genuinely, in user mode — two of them, one per
-core, in the same binary, talking to the kernel over a syscall interface.
+whose user applications run, genuinely, in user mode — eight of them, none
+pinned to a core, in the same binary, talking to the kernel over a syscall
+interface.
 
 Target: M5Stack Tab5, ESP32-P4 revision **v1.0**. ESP-IDF **v5.5.4**.
 
@@ -76,9 +77,12 @@ capture is held open on the other.
 
 ## What It Does
 
-Two U-mode applications and one M-mode task run concurrently. On boot the
-kernel prints what the privilege and memory configuration actually **is**,
-rather than assuming it:
+Eight U-mode applications and one M-mode task run concurrently on two cores.
+**Nothing is pinned:** every task is created with `tskNO_AFFINITY`, so which
+core a U-mode window runs on is the scheduler's choice and changes constantly.
+
+On boot the kernel prints what the privilege and memory configuration actually
+**is**, rather than assuming it:
 
 ```
 === ESP32-P4 protected-mode demo: M-mode kernel, U-mode user ===
@@ -86,60 +90,82 @@ KERNEL: mstatus=00010088 mtvec=4ff00003 mintstatus=00000000
 KERNEL: pmpcfg 0=809d9b9b 1=8d808b8d 2=80000089 3=9b8b8d8b
 KERNEL: IRAM text ends at 4ff0fa00; PMP entry 4 grants U-mode R+X below it
 KERNEL: user text  4ff01d86 (inside the U-mode execute grant)
-KERNEL: 2 U-mode windows, one per core, sharing that one user_main:
-KERNEL:   user0 on core 0, arena 4ff150d0..4ff170d0 (8192 bytes, stack and data)
-KERNEL:   user1 on core 1, arena 4ff130d0..4ff150d0 (8192 bytes, stack and data)
+KERNEL: 8 U-mode windows, NONE of them pinned, sharing that one user_main:
+KERNEL:   user0 arena 4ff13690..4ff15690 (8192 bytes, stack and data)
+KERNEL:   user1 arena 4ff15690..4ff17690 (8192 bytes, stack and data)
+...
+KERNEL:   user7 arena 4ff21690..4ff23690 (8192 bytes, stack and data)
 KERNEL: the arenas are separate objects and every syscall pointer is
-KERNEL:   checked against the calling user's own bounds, so neither
-KERNEL:   user can reach the other's memory through the kernel
+KERNEL:   checked against the calling user's own bounds, so no user
+KERNEL:   can reach another's memory through the kernel
 KERNEL: hardware stack guard follows each window on to its own arena,
 KERNEL:   read from the assist_debug block of the core it runs on
-KERNEL: COST: both cores are un-routed from the shared assist_debug
-KERNEL:   source, so ESP-IDF no longer panics on an M-mode stack
-KERNEL:   overflow on either core.  The monitors still latch, and each
-KERNEL:   window still reports its own user's excursions.
-Kernel 1
-KERNEL: user0: entering U-mode on core 0 at pc=4ff01d86 sp=4ff170d0
+Kernel 1 (core 0)
 KERNEL: user0: first syscall arrived with mcause=08000008 (ECALL from U-mode) on core 0 -- user_main is running unprivileged
-KERNEL: user1: entering U-mode on core 1 at pc=4ff01d86 sp=4ff150d0
-KERNEL: user1: first syscall arrived with mcause=08000008 (ECALL from U-mode) on core 1 -- user_main is running unprivileged
 ```
 
-Then all five cadences interleave indefinitely:
+Then the windows run, and move:
 
 ```
-Kernel 2
-Kernel 3
-User 0.1
-User 1.1
-Kernel 4
-syscall 0.1
-syscall 1.1
-Kernel 5
-User 0.2
-User 1.2
+User 0.2 on core 1
+User 1.2 on core 1
+User 2.2 on core 1
+User 3.2 on core 0
+User 4.2 on core 1
+Kernel 7 (core 0)
+KERNEL: window:core/moves u0:c0/578300 u1:c1/548421 u2:c0/607706 u3:c0/563506 u4:c0/557972 u5:c0/551322 u6:c1/546088 u7:c0/618362
 ```
 
-| Line | Emitted by | Privilege | Core | Cadence | Path |
-|---|---|---|---|---|---|
-| `Kernel x` | `kernel_task` | M | 0 | 1 s | `printf` |
-| `User 0.y` | `user_main(0)` | **U** | 0 | 2 s | `SYS_WRITE` |
-| `syscall 0.z` | `user_main(0)` | **U** | 0 | 3 s | `SYS_PUTS` — the kernel prints the message it was handed |
-| `User 1.y` | `user_main(1)` | **U** | 1 | 2 s | `SYS_WRITE` |
-| `syscall 1.z` | `user_main(1)` | **U** | 1 | 3 s | `SYS_PUTS` |
+| Line | Emitted by | Privilege | Says |
+|---|---|---|---|
+| `Kernel x (core c)` | `kernel_task` | M | An ordinary FreeRTOS task, also unpinned |
+| `User n.m on core c` | `user_main(n)` | **U** | Via `SYS_WRITE`, with the core from `SYS_GETCORE` |
+| `syscall n.m` | `user_main(n)` | **U** | Via `SYS_PUTS` — the kernel prints the message it was handed |
+| `window:core/moves` | `kernel_task` | M | Where each window is now, and how often it has changed core |
 
-`user1` is staggered half a tick behind `user0` so the two interleave in the log
-rather than landing on the same second and reading as one.
+**Two numbers in that output are the whole point.**
 
-**`mcause=08000008` is the load-bearing line in that boot report.** Exception
-code 8 is `ECALL_U` — an `ecall` taken *from user mode*. Code 11 would be
-`ECALL_M`. The kernel is not claiming the user is unprivileged; the hardware is
-telling it so, and it says so once per user so the log carries the proof for
-both independently.
+`mcause=08000008` is exception code 8, `ECALL_U` — an `ecall` taken *from user
+mode*. Code 11 would be `ECALL_M`. The kernel is not claiming the user is
+unprivileged; the hardware is telling it so, once per user, so the log carries
+the proof for all eight independently.
 
-The cadences are independent because the user applications are asleep on a real
-`vTaskDelay` between syscalls, so the scheduler runs the kernel task normally
-while a U-mode window is parked.
+The `on core c` in each user's own line came from **`SYS_GETCORE`**. U-mode
+cannot read `mhartid` — it is a CSR, and a `csr` instruction from U-mode is an
+illegal instruction ([Exercise 1](#exercise-1-execute-a-privileged-instruction))
+— so the only way a user can know where it is running is to ask the kernel.
+That number is therefore evidence of two things at once: the syscall interface
+works, and the window is not where it was last time.
+
+Over 40 s on hardware, each of the eight windows changed core between 450 000
+and 618 000 times, with no faults.
+
+## Why the Users Are Busy
+
+The user loop is a burst of `SYS_YIELD` calls followed by a sleep, which is not
+the obvious shape for a demo. Both halves are there for a reason, and both were
+arrived at by getting it wrong first.
+
+A user that only sleeps **never moves**. Only core 0 walks ESP-IDF's
+delayed-task list ([gotchas](#gotchas-worth-keeping)), so a sleeping task is
+woken by core 0 every time and runs there. Measured with a sleep-only loop:
+three unpinned windows, thirty seconds, **zero** core changes between them.
+Entirely correct, and it makes unpinned tasks look pinned.
+
+Being unpinned is not enough either. Two runnable tasks on two cores is a
+*stable* assignment — the scheduler has no reason to move anything. What moves
+tasks is **oversubscription**, so the burst keeps each user runnable long enough
+to overlap the others, and eight of them over two cores are then permanently
+oversubscribed. Spreading the users evenly across the period made things worse,
+not better: evenly spread means the bursts never overlap.
+
+| Configuration | Core changes per user, 30–40 s |
+|---|---|
+| 3 windows, sleep only | 0 |
+| 3 windows, short burst, evenly staggered | 0 |
+| 3 windows, short burst, overlapping | ~26 |
+| 3 windows, long burst | ~145 000 |
+| 8 windows, short burst | ~450 000–618 000 |
 
 ---
 
@@ -168,7 +194,7 @@ FreeRTOS has no notion of a user mode, and this tree does not modify FreeRTOS.
 So U-mode is not a task. A perfectly ordinary FreeRTOS task **hosts** it:
 
 ```
-user_host_task (M-mode, FreeRTOS, pinned to one core)
+user_host_task (M-mode, FreeRTOS, unpinned — one per window)
     |
     +-- umode_enter(&slot->ctx) -----------.
     |     save kernel regs and mstatus     |
@@ -215,6 +241,8 @@ the trap with its return value in place.
 | 2 | `SYS_PUTS` | NUL-terminated message → 0 | `SYS_ERR_FAULT`, user continues |
 | 3 | `SYS_DELAY_MS` | Milliseconds | — |
 | 4 | `SYS_EXIT` | Status; does not return | — |
+| 5 | `SYS_GETCORE` | — → the core this window is running on | — |
+| 6 | `SYS_YIELD` | — → 0; gives up the core without blocking | — |
 
 `SYS_PUTS` is message passing: U-mode hands over a string, the kernel validates
 it, copies it out of the user's arena and prints it. `SYS_WRITE` is separate on
@@ -230,10 +258,10 @@ a fatal fault. A privilege violation or a stack excursion retires the context.
 Both behaviours are worth seeing — Exercises [1](#exercise-1-execute-a-privileged-instruction)
 and [3](#exercise-3-hand-the-kernel-a-pointer-outside-your-arena).
 
-## 1.4 One Window per Core, and What That Forces
+## 1.4 Eight Windows, Two Cores, No Pins
 
-There are two U-mode windows, one per core, running at the same time. Getting
-there is mostly a lesson in **which processor state is per-hart**.
+There are eight U-mode windows and two cores, and no window is tied to either.
+Getting there is mostly a lesson in **which processor state is per-hart**.
 
 Per-hart, therefore free: every CSR the window borrows — `mtvec`, `mtvt`,
 `mscratch`, `mepc`, `mcause`, `mstatus`, `mintstatus` — plus the CLIC interrupt
@@ -256,20 +284,16 @@ window code re-entrantly.
 **A window cannot span two cores**, and it does not need a pin to guarantee
 that. `umode_enter()` takes `mstatus.MIE` down *before* it snapshots any
 per-hart CSR, so from there to the closing `mret` the hart cannot be preempted
-and every hart-specific value is read and restored on the same core. Before
-that ordering was fixed the snapshot came first, and a tick landing in the gap
-could migrate the task and put core A's vectors back on core B — which is why
-the host tasks used to have to be pinned.
+and every hart-specific value is read and restored on the same core. That
+ordering is the entire reason this demo is allowed to leave everything
+unpinned, and it is worth reading [3.6](#36-per-hart-state-must-be-snapshotted-behind-the-mask)
+before changing anything in that prologue.
 
-They are still pinned, but now as a choice rather than a requirement: it keeps
-the console output in a predictable order. `configASSERT(xPortGetCoreID() ==
-u->core)` checks that the pin took effect, and `USER_CORE(n)` in
-`kernel_main.c` is the mapping. Not pinning them at all also works.
-
-Kernel-side state is per-slot for the same reason. `user_slot_t` carries each
-window's name, id, core, arena, context, run flag and counters; two host tasks
-on two cores sharing one counter would be a data race with no lock in sight.
-The console mutex is the only thing the two deliberately share.
+Between windows the scheduler may put a host task anywhere, and in this demo it
+constantly does. Nothing in the kernel side objects, because kernel-side state
+is per-slot: `user_slot_t` carries each window's name, id, arena, context, run
+flag and counters, so eight host tasks on two cores share no mutable state. The
+console mutex is the only thing they deliberately share.
 
 ---
 
@@ -292,10 +316,11 @@ Suggested order:
 
 Things to look for as you go:
 
-- In `user_main.c`: **no writable statics.** Two cores run this one copy at
-  once, so anything static and mutable would be shared with no lock. Every
-  variable is a local — on the calling window's own arena stack — or `const`.
-  `id`, delivered in the context's `a0`, is how an instance knows which it is.
+- In `user_main.c`: **no writable statics.** Eight windows run this one copy
+  at once, across two cores, so anything static and mutable would be shared
+  with no lock. Every variable is a local — on the calling window's own arena
+  stack — or `const`. `id`, delivered in the context's `a0`, is how an instance
+  knows which it is.
 - In `kernel_main.c`: `user_range_ok()` takes the **slot**, not just an address.
   [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly) explains why that
   is load-bearing rather than tidy.
@@ -323,7 +348,7 @@ Four constraints, all consequences of running unprivileged:
   rodata happens to be U-readable in this configuration, but depending on that
   would tie the app to a PMP entry it has no reason to need.
 
-- **No writable statics**, as above, because there is more than one instance.
+- **No writable statics**, as above, because eight instances share the code.
 
 `gp` and `tp` are deliberately **not** loaded from the user context: U-mode
 inherits the kernel's, so gp-relative addressing would work if the compiler
@@ -637,7 +662,9 @@ Note `sp` is reported back **inside** the allowed range. The excursion was
 transient, and it was caught anyway, because `INTR_RAW` is sticky
 ([3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch)). `detected at
 pc` is the instruction the peripheral latched — the `add` that did it. The
-bounds printed are **user1's own** arena, read from core 1's register block.
+bounds printed are **user1's own** arena, read from the assist_debug block of
+whichever core that window happened to be running on — this capture is from an
+earlier two-window build, where it was core 1.
 
 ## Exercise 3: Hand the Kernel a Pointer Outside Your Arena
 
@@ -676,19 +703,26 @@ this check. To see the check itself rather than a user's view of it, call
 `user_range_ok(&g_slots[0], (uint32_t)(uintptr_t) g_slots[1].arena, 1)` in
 `kernel_main()` and print the result.
 
-## Exercise 5: Change Which Cores the Windows Run on
+## Exercise 5: Pin the Windows Again
 
-`USER_CORE(n)` in `kernel_main.c` maps slot to core. Try:
+Nothing is pinned by default. In `kernel_main()`, change the host tasks'
+`tskNO_AFFINITY` to a real core and watch what changes:
 
-- swapping them, so `user0` runs on core 1;
-- putting both on one core.
+- pin every window to core 0, and the two cores stop sharing the work;
+- pin half to core 0 and half to core 1, and each half stops moving;
+- pin some and leave others floating — a mix works, and the floating ones still
+  migrate around the pinned ones.
 
-Both should work — the per-core machinery is resolved at run time from
-`mhartid`. With both slots on one core you no longer have one window per core,
-so the `USER_SLOTS == SOC_CPU_CORES_NUM` assertion is no longer describing what
-you built, and the un-route in `kernel_main()` is wider than it needs to be.
-Watch the two windows time-slice on a single core instead of running
-concurrently.
+All of these work, because the per-core machinery is resolved at run time from
+`mhartid` and a window is bounded by its own core's interrupt mask rather than
+by an affinity. The interesting part is the migration counter in the
+`window:core/moves` line: it goes to zero for whatever you pin, and stays high
+for whatever you do not.
+
+Then try the opposite experiment — delete the `SYS_YIELD` burst from
+`user_main` so the users only sleep, leave everything unpinned, and watch the
+counters go to **zero anyway**. That is not a bug; it is
+[why the users are busy](#why-the-users-are-busy).
 
 ## Exercise 6: Return from `user_main`
 
@@ -739,7 +773,8 @@ just its own. So:
 - the kernel validates every pointer arriving from a syscall against **the
   calling slot's** arena (`user_range_ok()`), which is good practice regardless,
   but here it is doing work the hardware would otherwise do;
-- the isolation between the two users is entirely software, for the same reason;
+- the isolation between the eight users is entirely software, for the same
+  reason — nothing in the hardware separates one arena from another;
 - the stack guard does **not** close the gap and should not be mistaken for it.
   It watches `sp`, not accesses. A user that leaves `sp` alone and writes through
   a wild pointer is caught by neither, which is what `user_range_ok()` is for.
@@ -966,7 +1001,7 @@ matches:
 - `components/esp_system/port/include/private/esp_private/hw_stack_guard.h` —
   the stack-guard macros `umode.S` uses, and the `SOC_CPU_CORES_NUM` gate that
   decides whether they dispatch on `mhartid`
-  ([1.4](#14-one-window-per-core-and-what-that-forces));
+  ([1.4](#14-eight-windows-two-cores-no-pins));
 - `components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S` — how the port
   itself arms the guard on every interrupt exit, which is what
   [3.1](#31-the-hardware-stack-guard-fires-on-the-stack-switch) has to work
@@ -1014,11 +1049,16 @@ Getting to a single working window took one fix, described in
 stack guard fired on the U-mode stack switch and panicked the kernel on the way
 back out, before any user output could be printed.
 
-Getting to one window per core took two: making `umode.S` core-agnostic
-([1.4](#14-one-window-per-core-and-what-that-forces)), and accepting the
-un-route trade-off in [3.5](#35-one-interrupt-source-two-monitors). Per-slot
-arenas and per-slot pointer validation came with it, and the isolation between
-the two users was verified in both directions.
+Getting to more than one window took two: making `umode.S` core-agnostic
+([1.4](#14-eight-windows-two-cores-no-pins)) and accepting the un-route
+trade-off in [3.5](#35-one-interrupt-source-two-monitors). Per-slot arenas and
+per-slot pointer validation came with it, and the isolation between users was
+verified in both directions.
+
+Getting to eight *unpinned* windows took one more: the prologue ordering in
+[3.6](#36-per-hart-state-must-be-snapshotted-behind-the-mask). Measured over
+40 s, each of the eight changed core between 450 000 and 618 000 times with no
+fault, which is the demo and the evidence being the same thing.
 
 No probes are in the tree. Builds clean for `esp32p4`, and the placement
 assumptions are verified in the ELF: user text and the trap machinery sit below

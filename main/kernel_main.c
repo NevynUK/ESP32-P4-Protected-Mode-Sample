@@ -174,24 +174,35 @@
  * mhartid, and umode.S has no writable data of its own -- its only sections are
  * "ax" and "a" -- so both cores run the same window code re-entrantly.
  *
- * A window cannot span two cores, but it no longer needs a pin to guarantee
- * that: umode_enter() takes mstatus.MIE down before it snapshots any per-hart
- * CSR, so from that point to the closing mret the hart cannot be preempted and
- * everything hart-specific is both read and restored on the same core.  The
- * host tasks are still pinned here, but that is now a choice -- it keeps the
- * console output in a predictable order and makes the demo easier to reason
- * about -- rather than a correctness requirement.  WHICH core each one is
- * pinned to is free, and so is not pinning them at all.
+ * NOTHING HERE IS PINNED.  Both host tasks and the kernel task are created
+ * with tskNO_AFFINITY, so which core a U-mode window runs on is the
+ * scheduler's choice and can change from one window to the next.
  *
- * The kernel task is pinned to USER_CORE(0) only to keep the console output in
- * a predictable order.
+ * A window still cannot span two cores, but it does not need an affinity to
+ * guarantee that: umode_enter() takes mstatus.MIE down BEFORE it snapshots any
+ * per-hart CSR, so from that point to the closing mret the hart cannot be
+ * preempted and everything hart-specific is read and restored on the same
+ * core.  Get that ordering wrong and a tick landing in the gap puts one core's
+ * vectors back on another -- see 3.6 in the README, which is the reason this
+ * file is allowed to say the sentence above.
  */
 
-#define USER_SLOTS 2
+/* Three windows on two cores, deliberately.
+ *
+ * Two unpinned windows on two cores is a stable assignment: the scheduler has
+ * no reason to move either, and the demo shows two tasks that are unpinned in
+ * principle and motionless in practice.  Oversubscribing the cores is what
+ * makes the scheduler actually move them, so the claim can be watched rather
+ * than taken on trust.
+ */
 
-#define USER_CORE(n) (n)
+#define USER_SLOTS 8
 
 #define KERNEL_PERIOD_MS 1000
+
+/* How often kernel_task prints the window/core summary, in its own periods */
+
+#define MIGRATION_REPORT_EVERY 3
 
 /* Longest SYS_PUTS message the kernel will copy out of the arena */
 
@@ -208,8 +219,13 @@
  * object with its own bounds, which is what user_range_ok() checks against.
  */
 
-static uint8_t g_user0_arena[USER_ARENA_SIZE] __attribute__((aligned(16)));
-static uint8_t g_user1_arena[USER_ARENA_SIZE] __attribute__((aligned(16)));
+static uint8_t g_user_arenas[USER_SLOTS][USER_ARENA_SIZE] __attribute__((aligned(16)));
+
+/* Names live here rather than as string literals because the slots are built
+ * in a loop now; "user0".."user7" at eight slots.
+ */
+
+static char g_slot_names[USER_SLOTS][8];
 
 /* Everything one U-mode window owns.
  *
@@ -227,7 +243,8 @@ typedef struct
 {
     const char *name;         /* what the kernel calls it in messages       */
     uint32_t id;              /* passed to user_main() in a0                */
-    int core;                 /* the core its host task is pinned to        */
+    int core;                 /* the core its last window ran on            */
+    uint32_t migrations;      /* windows resumed on a different core        */
     uint8_t *arena;           /* its U-mode memory: stack and data          */
     uint32_t arena_size;
 
@@ -249,22 +266,7 @@ typedef struct
     bool umode_confirmed;
 } user_slot_t;
 
-static user_slot_t g_slots[USER_SLOTS] = {
-    {
-        .name = "user0",
-        .id = 0,
-        .core = USER_CORE(0),
-        .arena = g_user0_arena,
-        .arena_size = sizeof(g_user0_arena),
-    },
-    {
-        .name = "user1",
-        .id = 1,
-        .core = USER_CORE(1),
-        .arena = g_user1_arena,
-        .arena_size = sizeof(g_user1_arena),
-    },
-};
+static user_slot_t g_slots[USER_SLOTS];
 
 static SemaphoreHandle_t g_console_mux;
 
@@ -334,13 +336,13 @@ _Static_assert(SOC_CPU_CORES_NUM == 2, "the assist_debug stride arithmetic assum
 
 #endif
 
-/* One window per core, and USER_CORE(n) == n, so the slot count and the core
- * count have to agree.  If they ever stop agreeing, two slots would land on one
- * core -- which is not itself unsafe, but it is not what this demo claims to
- * show, and the un-route above would then be needlessly wide.
+/* Nothing ties the slot count to the core count any more: a window is bounded
+ * by its own core's interrupt mask rather than by an affinity, so any number of
+ * windows can share any number of cores.  Two slots are kept because two is
+ * enough to show two unpinned windows open at once.
  */
 
-_Static_assert(USER_SLOTS == SOC_CPU_CORES_NUM, "USER_SLOTS and SOC_CPU_CORES_NUM disagree; USER_CORE(n) maps one slot per core");
+_Static_assert(USER_SLOTS >= 2, "one window proves nothing about two windows sharing the cores");
 
 /* umode.S cannot include soc/clic_reg.h, so it carries its own copy of the
  * CLIC threshold address.  Keep the two honest.
@@ -567,6 +569,29 @@ static bool syscall_dispatch(user_slot_t *u)
             vTaskDelay(pdMS_TO_TICKS(arg0));
             break;
 
+        case SYS_YIELD:
+
+            /* Stay runnable, but give the scheduler a decision point.  This is
+             * what lets a U-mode window move: a user that only ever sleeps is
+             * woken by core 0 every time -- core 0 is the only core that walks
+             * the delayed-task list -- and so never leaves it.
+             */
+
+            taskYIELD();
+            break;
+
+        case SYS_GETCORE:
+
+            /* U-mode cannot read mhartid: it is a CSR, and a csr instruction
+             * from U-mode is an illegal instruction.  Asking the kernel is the
+             * only way the user can know where it is running, which is what
+             * makes it worth printing -- the core number in the user's own
+             * output line came back through the syscall interface.
+             */
+
+            ret = (uint32_t) xPortGetCoreID();
+            break;
+
         case SYS_EXIT:
             kprintf("KERNEL: %s: user_main exited, status %lu\n", u->name, (unsigned long) arg0);
             return false;
@@ -718,12 +743,32 @@ static void kernel_task(void *arg)
 {
     TickType_t last = xTaskGetTickCount();
     uint32_t n = 1;
+    int i;
 
     (void) arg;
 
     for (;;)
     {
-        kprintf("Kernel %lu\n", (unsigned long) n++);
+        kprintf("Kernel %lu (core %d)\n", (unsigned long) n++, xPortGetCoreID());
+
+        /* Where every U-mode window is, and how often each has moved, on one
+         * line -- eight of them do not fit one per line.  Read without a lock:
+         * these are 32-bit aligned words on RV32, so each read is atomic and
+         * the worst case is a figure one window stale.
+         */
+
+        if ((n % MIGRATION_REPORT_EVERY) == 0)
+        {
+            char line[USER_SLOTS * 20 + 1];
+            int off = 0;
+
+            for (i = 0; i < USER_SLOTS; i++)
+            {
+                off += snprintf(line + off, sizeof(line) - (size_t) off, " u%d:c%d/%lu", i, g_slots[i].core, (unsigned long) g_slots[i].migrations);
+            }
+
+            kprintf("KERNEL: window:core/moves%s\n", line);
+        }
         vTaskDelayUntil(&last, pdMS_TO_TICKS(KERNEL_PERIOD_MS));
     }
 }
@@ -747,11 +792,11 @@ static void user_host_task(void *arg)
 {
     user_slot_t *u = (user_slot_t *) arg;
 
-    /* The pin is a correctness requirement, not a preference -- see the
-     * comment on USER_CORE above -- so check it rather than assume it.
+    /* Nothing to assert: where this runs is the scheduler's business.  Record
+     * where it started so the first window is not counted as a move.
      */
 
-    configASSERT(xPortGetCoreID() == u->core);
+    u->core = xPortGetCoreID();
 
     user_ctx_init(u);
 
@@ -762,6 +807,18 @@ static void user_host_task(void *arg)
     while (u->running)
     {
         const uint32_t cause = umode_enter(&u->ctx);
+        const int core = xPortGetCoreID();
+
+        /* The window just ran somewhere.  If that is not where the last one
+         * ran, the scheduler moved this task between windows -- which is the
+         * whole point of the demo, so it is counted rather than assumed.
+         */
+
+        if (core != u->core)
+        {
+            u->core = core;
+            u->migrations++;
+        }
 
         /* Checked before the trap cause, because it is independent of it: the
          * user overflowed its stack at some point in the window and then got
@@ -798,8 +855,8 @@ static void user_host_task(void *arg)
 
     kprintf(
         "KERNEL: %s: user context retired after %lu syscalls "
-        "(%lu interrupts taken in U-mode)\n",
-        u->name, (unsigned long) u->syscalls, (unsigned long) u->irqs_in_user);
+        "(%lu interrupts taken in U-mode, %lu core changes)\n",
+        u->name, (unsigned long) u->syscalls, (unsigned long) u->irqs_in_user, (unsigned long) u->migrations);
 
     vTaskDelete(NULL);
 }
@@ -828,20 +885,25 @@ static void boot_report(void)
         "below it\n",
         (unsigned long) iram_end);
     kprintf("KERNEL: user text  %08lx (%s)\n", (unsigned long) user_pc, (user_pc >= SOC_IRAM_LOW && user_pc < iram_end) ? "inside the U-mode execute grant" : "OUTSIDE the grant -- U-mode will fault on the fetch");
-    kprintf("KERNEL: %d U-mode windows, one per core, sharing that one user_main:\n", USER_SLOTS);
+    kprintf("KERNEL: %d U-mode windows, NONE of them pinned, sharing that one user_main:\n", USER_SLOTS);
 
     for (i = 0; i < USER_SLOTS; i++)
     {
         const user_slot_t *u = &g_slots[i];
         const uintptr_t lo = (uintptr_t) u->arena;
 
-        kprintf("KERNEL:   %s on core %d, arena %08lx..%08lx (%u bytes, stack and data)\n", u->name, u->core, (unsigned long) lo, (unsigned long) (lo + u->arena_size), (unsigned) u->arena_size);
+        /* No core is printed: nothing is pinned, so where this window runs is
+         * not decided yet and will not stay decided.  kernel_task reports the
+         * live answer once things are running.
+         */
+
+        kprintf("KERNEL:   %s arena %08lx..%08lx (%u bytes, stack and data)\n", u->name, (unsigned long) lo, (unsigned long) (lo + u->arena_size), (unsigned) u->arena_size);
     }
 
     kprintf(
         "KERNEL: the arenas are separate objects and every syscall pointer is\n"
-        "KERNEL:   checked against the calling user's own bounds, so neither\n"
-        "KERNEL:   user can reach the other's memory through the kernel\n");
+        "KERNEL:   checked against the calling user's own bounds, so no user\n"
+        "KERNEL:   can reach another's memory through the kernel\n");
 
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
     kprintf("KERNEL: hardware stack guard follows each window on to its own arena,\n");
@@ -916,9 +978,19 @@ void kernel_main(void)
 
 #endif
 
+    for (int i = 0; i < USER_SLOTS; i++)
+    {
+        snprintf(g_slot_names[i], sizeof(g_slot_names[i]), "user%d", i);
+
+        g_slots[i].name = g_slot_names[i];
+        g_slots[i].id = (uint32_t) i;
+        g_slots[i].arena = g_user_arenas[i];
+        g_slots[i].arena_size = sizeof(g_user_arenas[i]);
+    }
+
     boot_report();
 
-    xTaskCreatePinnedToCore(kernel_task, "kernel", KERNEL_TASK_STACK, NULL, KERNEL_TASK_PRIO, NULL, USER_CORE(0));
+    xTaskCreatePinnedToCore(kernel_task, "kernel", KERNEL_TASK_STACK, NULL, KERNEL_TASK_PRIO, NULL, tskNO_AFFINITY);
 
     /* One host task per slot, each pinned to its slot's core.  The task name
      * carries the slot name so the two are distinguishable in any FreeRTOS
@@ -928,7 +1000,7 @@ void kernel_main(void)
 
     for (int i = 0; i < USER_SLOTS; i++)
     {
-        xTaskCreatePinnedToCore(user_host_task, g_slots[i].name, USER_HOST_STACK, &g_slots[i], USER_HOST_PRIO, NULL, g_slots[i].core);
+        xTaskCreatePinnedToCore(user_host_task, g_slots[i].name, USER_HOST_STACK, &g_slots[i], USER_HOST_PRIO, NULL, tskNO_AFFINITY);
     }
 }
 

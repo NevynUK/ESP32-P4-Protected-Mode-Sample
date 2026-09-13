@@ -31,6 +31,8 @@
 #define SYS_PUTS       2    /* a0 = NUL-terminated message -> 0             */
 #define SYS_DELAY_MS   3    /* a0 = milliseconds -> 0                       */
 #define SYS_EXIT       4    /* a0 = status; does not return                 */
+#define SYS_GETCORE    5    /* -> the core this window is running on        */
+#define SYS_YIELD      6    /* give up the core without blocking -> 0       */
 #define SYS_MAX        5
 
 /* Returned in a0 when the kernel rejects the call */
