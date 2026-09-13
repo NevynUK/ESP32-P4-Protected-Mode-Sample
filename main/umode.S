@@ -772,6 +772,100 @@ umode_read_pmpcfg:
   ret
   .size umode_read_pmpcfg, .-umode_read_pmpcfg
 
+/****************************************************************************
+ * Name: umode_read_pmpaddr
+ *
+ * Description:
+ *   uint32_t umode_read_pmpaddr(uint32_t idx)
+ *
+ *   pmpaddr0..15.  The CSR number has to be an immediate, so this is sixteen
+ *   branches rather than anything clever.
+ *
+ ****************************************************************************/
+
+  .balign 4
+  .global umode_read_pmpaddr
+  .type   umode_read_pmpaddr, @function
+umode_read_pmpaddr:
+  li    t0, 1
+  beq   a0, t0, 10f
+  li    t0, 2
+  beq   a0, t0, 20f
+  li    t0, 3
+  beq   a0, t0, 30f
+  li    t0, 4
+  beq   a0, t0, 40f
+  li    t0, 5
+  beq   a0, t0, 50f
+  li    t0, 6
+  beq   a0, t0, 60f
+  li    t0, 7
+  beq   a0, t0, 70f
+  li    t0, 8
+  beq   a0, t0, 80f
+  li    t0, 9
+  beq   a0, t0, 90f
+  li    t0, 10
+  beq   a0, t0, 100f
+  li    t0, 11
+  beq   a0, t0, 110f
+  li    t0, 12
+  beq   a0, t0, 120f
+  li    t0, 13
+  beq   a0, t0, 130f
+  li    t0, 14
+  beq   a0, t0, 140f
+  li    t0, 15
+  beq   a0, t0, 150f
+  csrr  a0, pmpaddr0
+  ret
+10:
+  csrr  a0, pmpaddr1
+  ret
+20:
+  csrr  a0, pmpaddr2
+  ret
+30:
+  csrr  a0, pmpaddr3
+  ret
+40:
+  csrr  a0, pmpaddr4
+  ret
+50:
+  csrr  a0, pmpaddr5
+  ret
+60:
+  csrr  a0, pmpaddr6
+  ret
+70:
+  csrr  a0, pmpaddr7
+  ret
+80:
+  csrr  a0, pmpaddr8
+  ret
+90:
+  csrr  a0, pmpaddr9
+  ret
+100:
+  csrr  a0, pmpaddr10
+  ret
+110:
+  csrr  a0, pmpaddr11
+  ret
+120:
+  csrr  a0, pmpaddr12
+  ret
+130:
+  csrr  a0, pmpaddr13
+  ret
+140:
+  csrr  a0, pmpaddr14
+  ret
+150:
+  csrr  a0, pmpaddr15
+  ret
+  .size umode_read_pmpaddr, .-umode_read_pmpaddr
+
   .option pop
 
 /****************************************************************************
