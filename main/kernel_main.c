@@ -137,6 +137,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -221,10 +222,43 @@
  * object with its own bounds, which is what user_range_ok() checks against.
  */
 
-/* The arenas are allocated from PSRAM at start-up rather than being static
- * arrays in internal .bss.  There are 32 MB of it and the users are the only
- * thing that needs to grow.
+/* The user side of the on-chip split.
+ *
+ * CONFIG_UMODE_ONCHIP_USER_KB of internal SRAM that belongs to U-mode; the
+ * kernel keeps every other byte.  The PMP grants read and write over exactly
+ * this range, so the kernel's heap, stacks and data are unreachable from
+ * U-mode by hardware rather than by a check the kernel remembers to make.
+ *
+ * Aligned to the PMP's region granularity because the grant's bounds are this
+ * array's bounds, and the hardware ignores address bits below that.
+ *
+ * The arenas are carved out of it by a bump allocator -- they are handed out
+ * once at start-up and never freed, so anything cleverer would be decoration.
  */
+
+#define USER_POOL_SIZE (CONFIG_UMODE_ONCHIP_USER_KB * 1024)
+
+static uint8_t g_user_pool[USER_POOL_SIZE]
+    __attribute__((aligned(SOC_CPU_PMP_REGION_GRANULARITY)));
+
+static size_t g_user_pool_used;
+
+_Static_assert(USER_POOL_SIZE >= USER_SLOTS * USER_ARENA_SIZE,
+               "CONFIG_UMODE_ONCHIP_USER_KB is too small to hold the arenas");
+
+static void *user_pool_alloc(size_t len)
+{
+    void *p;
+
+    len = (len + 15u) & ~(size_t) 15u;
+
+    configASSERT(g_user_pool_used + len <= sizeof(g_user_pool));
+
+    p = &g_user_pool[g_user_pool_used];
+    g_user_pool_used += len;
+
+    return p;
+}
 
 /* Names live here rather than as string literals because the slots are built
  * in a loop now; "user0".."user7" at eight slots.
@@ -725,6 +759,7 @@ static void report_stack_fault(const user_slot_t *u)
 static void user_ctx_init(user_slot_t *u)
 {
     umode_ctx_t *ctx = &u->ctx;
+    user_rodata_t *ro;
     uintptr_t stack_top;
     int i;
 
@@ -736,9 +771,22 @@ static void user_ctx_init(user_slot_t *u)
     stack_top = (uintptr_t) u->arena + u->arena_size;
     stack_top &= ~(uintptr_t) 15;
 
+    /* The user's strings go at the bottom of its arena and a1 points at them.
+     * They used to be constants in internal DRAM, which U-mode can no longer
+     * reach; putting them here means a user touches nothing but its own
+     * memory.
+     */
+
+    ro = (user_rodata_t *) u->arena;
+    memset(ro, 0, sizeof(*ro));
+    strncpy(ro->user_prefix, "User ", sizeof(ro->user_prefix) - 1);
+    strncpy(ro->core_infix, " on core ", sizeof(ro->core_infix) - 1);
+    strncpy(ro->syscall_prefix, "syscall ", sizeof(ro->syscall_prefix) - 1);
+
     ctx->x[1] = (uint32_t) (uintptr_t) u_exit_stub; /* ra */
     ctx->x[2] = (uint32_t) stack_top;               /* sp */
     ctx->x[10] = u->id;                             /* a0 = user_main's arg */
+    ctx->x[11] = (uint32_t) (uintptr_t) ro;         /* a1 = its strings     */
     ctx->pc = (uint32_t) (uintptr_t) user_main;
     ctx->mcause = 0;
     ctx->mtval = 0;
@@ -750,7 +798,7 @@ static void user_ctx_init(user_slot_t *u)
      * and is reported as a user fault rather than panicking the kernel.
      */
 
-    ctx->u_sp_min = (uint32_t) (uintptr_t) u->arena;
+    ctx->u_sp_min = (uint32_t) (uintptr_t) (u->arena + sizeof(user_rodata_t));
     ctx->u_sp_max = (uint32_t) stack_top;
     ctx->sp_fired = 0;
     ctx->sp_pc = 0;
@@ -912,10 +960,12 @@ static void user_host_task(void *arg)
  *
  ****************************************************************************/
 
-#define PMP_R      (1u << 0)
-#define PMP_W      (1u << 1)
-#define PMP_X      (1u << 2)
-#define PMP_A_TOR  (1u << 3)
+/* Prefixed because IDF's riscv/csr.h defines PMP_R and friends already. */
+
+#define UPMP_R      (1u << 0)
+#define UPMP_W      (1u << 1)
+#define UPMP_X      (1u << 2)
+#define UPMP_A_TOR  (1u << 3)
 
 static void pmp_apply(void *arg)
 {
@@ -940,23 +990,26 @@ static void pmp_apply(void *arg)
 
     addr[0] = SOC_IRAM_LOW >> 2;
     addr[1] = iram_text_end >> 2;
-    byte[1] = PMP_A_TOR | PMP_R | PMP_X;
+    byte[1] = UPMP_A_TOR | UPMP_R | UPMP_X;
 
-    /* [_iram_text_end, SOC_DRAM_HIGH) -- internal data.  Still all of it, so
-     * this is not yet a split: it reproduces what IDF granted, so that taking
-     * the PMP over can be verified on its own before the policy changes.
+    /* The user pool, and ONLY the user pool, out of all internal data memory.
+     * This is the split.  Everything else in internal SRAM -- the kernel's
+     * heap, its task stacks, its data, the slot table in TCM -- matches no
+     * entry, and PMP is default-deny for U-mode, so none of it is reachable
+     * from a user however wild its pointers get.
      */
 
-    addr[2] = SOC_DRAM_HIGH >> 2;
-    byte[2] = PMP_A_TOR | PMP_R | PMP_W;
+    addr[2] = ((uint32_t) (uintptr_t) g_user_pool) >> 2;
+    addr[3] = ((uint32_t) (uintptr_t) g_user_pool + sizeof(g_user_pool)) >> 2;
+    byte[3] = UPMP_A_TOR | UPMP_R | UPMP_W;
 
     /* [SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH) -- all 32 MB of PSRAM, where the user
      * arenas live.
      */
 
-    addr[3] = SOC_EXTRAM_LOW >> 2;
-    addr[4] = SOC_EXTRAM_HIGH >> 2;
-    byte[4] = PMP_A_TOR | PMP_R | PMP_W;
+    addr[4] = SOC_EXTRAM_LOW >> 2;
+    addr[5] = SOC_EXTRAM_HIGH >> 2;
+    byte[5] = UPMP_A_TOR | UPMP_R | UPMP_W;
 
     /* Everything else stays OFF, so U-mode cannot reach it: the peripherals,
      * RTC RAM and ROM that IDF used to grant, and TCM, which it never did.
@@ -1285,12 +1338,12 @@ void kernel_main(void)
         g_slots[i].name = g_slot_names[i];
         g_slots[i].id = (uint32_t) i;
 
-        /* Out of PSRAM, not internal .bss.  16-byte aligned because the user's
-         * stack starts at the top of it and the ABI wants that alignment.
+        /* Out of the on-chip user pool.  PSRAM is granted to U-mode as well
+         * and there are 32 MB of it, but the arenas are what the split is
+         * about, so they go in the memory the split governs.
          */
 
-        g_slots[i].arena = heap_caps_aligned_alloc(16, USER_ARENA_SIZE, MALLOC_CAP_SPIRAM);
-        configASSERT(g_slots[i].arena != NULL);
+        g_slots[i].arena = user_pool_alloc(USER_ARENA_SIZE);
         g_slots[i].arena_size = USER_ARENA_SIZE;
     }
 

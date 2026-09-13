@@ -766,6 +766,12 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# Protected mode demo
+#
+CONFIG_UMODE_ONCHIP_USER_KB=192
+# end of Protected mode demo
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
