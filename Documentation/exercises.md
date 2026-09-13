@@ -160,3 +160,42 @@ slot before writing a byte, and deciding whether a bad pointer retires the user
 or just returns `SYS_ERR_FAULT`. Get the first one wrong and you have handed
 every user a way to write into any other user's arena, which is precisely the
 hole [Part 5](isolation-limits.md#part-5--the-limit-of-the-isolation-stated-plainly) is about.
+
+## Exercise 9: Scribble on the Kernel's Slot Table
+
+*Is any of this enforced by hardware rather than by a check the kernel makes?*
+The boot report prints where the slot table lives. Add to `user_main`'s loop:
+
+```c
+if (id == 0 && tick == 18)
+{
+    *(volatile uint32_t *) 0x30100044u = 0xdeadbeefu;   /* the slot table */
+}
+```
+
+**Captured:**
+
+```
+KERNEL: user0: user fault: store access fault
+KERNEL:   mcause=08000007 mtval=30100044 pc=4ff01ed0 sp=4ff15000 ra=4ff01ebc
+KERNEL: user0: user context retired after 360028 syscalls
+User 1.3 on core 0
+User 2.3 on core 1
+```
+
+Three things to take from that:
+
+- `mcause=08000007` — exception code **7**, a store access fault. Bits 29:28 are
+  zero, so it came from U-mode ([3.3](hard-won-lessons.md#33-mcause-aliases-mstatusmpp)).
+- `mtval` is **exactly** the slot table address. The hardware names the thing it
+  refused, and nothing in the kernel had to check anything.
+- The other seven windows carry on. No panic.
+
+Now contrast it with [Exercise 3](#exercise-3-hand-the-kernel-a-pointer-outside-your-arena),
+where a bad pointer is caught by `user_range_ok()` — a *software* check, which
+only works because the pointer was handed to the kernel. Here the user never
+asked permission; it simply stored, and the PMP refused. That difference is the
+whole of [the isolation limits](isolation-limits.md#what-u-mode-cannot-reach).
+
+Then try the same store against one of the other users' arenas, whose addresses
+the boot report also prints. It succeeds silently. That is the gap.

@@ -33,20 +33,35 @@ just its own. So:
   but here it is doing work the hardware would otherwise do;
 - the isolation between the eight users is entirely software, for the same
   reason — nothing in the hardware separates one arena from another;
+- **with one exception: the slot table.** It lives in TCM, which no PMP entry
+  covers at all, so U-mode cannot reach it however it tries — see
+  [What U-mode Cannot Reach](#what-u-mode-cannot-reach) below;
 - the stack guard does **not** close the gap and should not be mistaken for it.
   It watches `sp`, not accesses. A user that leaves `sp` alone and writes through
   a wild pointer is caught by neither, which is what `user_range_ok()` is for.
 
 ### Reading the PMP Configuration
 
-The boot report prints the four `pmpcfg` words rather than describing them, so
-you can check the above rather than take it on trust:
+The boot report decodes all sixteen entries on the board rather than describing
+them here, so you can check the above rather than take it on trust:
 
 ```
-KERNEL: pmpcfg 0=809d9b9b 1=8d808b8d 2=80000089 3=9b8b8d8b
+KERNEL: PMP entries:
+KERNEL:    0 L NAPOT RW- 20000000..30000000
+KERNEL:    3 L OFF   --- matches nothing
+KERNEL:    4 L TOR   R-X 4ff00000..4ff0fb00
+KERNEL:    5 L TOR   RW- 4ff0fb00..4ffc0000
+KERNEL:    9 - OFF   --- matches nothing
+KERNEL:   13 L TOR   --- matches nothing
 ```
 
-Each word packs four entries, one byte each, entry 0 in the low byte:
+`L` is the lock bit, then the matching mode, then the permissions. Two entries
+in that list are doing nothing at all: 9 and 10 are unlocked and unprogrammed,
+and **13 is a TOR entry whose base and limit are the same address**, so it
+matches an empty range. One of the sixteen is wasted.
+
+The raw `pmpcfg` words are printed too. Each packs four entries, one byte each,
+entry 0 in the low byte:
 
 | Bit | Field | Values |
 |---|---|---|
@@ -101,10 +116,61 @@ cannot *narrow* a grant a lower entry has already made.
 That is the structural reason this gap cannot be closed by adding entries. It can
 only be closed by changing entries 4 and 5, and those are locked.
 
-Note also that the report prints `pmpcfg` but not `pmpaddr`, so it gives you
-permissions and matching modes but not the boundaries. Those come from
 `components/esp_hw_support/port/esp32p4/cpu_region_protect.c` in your IDF
-checkout, which is the file to read alongside this table.
+checkout is the file to read alongside this table — it is what programs every
+entry above.
+
+### What U-mode Cannot Reach
+
+Subtracting the covered ranges from the memory map gives the other half of the
+picture, and the boot report does that too. **PMP is default-deny for U-mode and
+default-allow for M-mode**, so an address no entry matches is unreachable from
+U-mode and perfectly reachable from the kernel:
+
+```
+KERNEL: no PMP entry matches these, so U-mode cannot reach them at
+KERNEL:   all while the kernel still can:
+KERNEL:   internal SRAM  -- fully covered, U-mode reaches all of it
+KERNEL:   PSRAM window   48000000..4c000000 (65536 KiB)
+KERNEL:   flash window   40030000..44000000 (65344 KiB)
+KERNEL:   TCM            30100000..30102000 (8 KiB)
+KERNEL:   RTC / LP RAM   -- fully covered, U-mode reaches all of it
+KERNEL:   peripherals    -- fully covered, U-mode reaches all of it
+```
+
+Those ranges are the only memory on this board that U-mode cannot touch **by
+hardware**, and they cost nothing: no unlocking, no reconfiguration, no spare
+PMP entry. They are simply what IDF never described.
+
+**TCM is the usable one.** 8 KiB of internal memory, tightly coupled to the
+CPU — wired into the pipeline rather than reached through the system bus, so
+access is fast and deterministic — and shared between both cores rather than a
+per-core alias like the CLIC. That last point matters here: an unpinned host
+task has to see the same slot wherever it runs.
+
+So the slot table lives there:
+
+```
+KERNEL: slot table at 30100044 (1856 bytes) -- in TCM, which no PMP entry
+                                               covers, so U-mode cannot reach it
+```
+
+`g_slots` holds every window's **saved context**. Before the move, one user
+scribbling at random could corrupt another window's saved registers — the
+weakest link in an isolation story that is otherwise entirely software. Now it
+cannot, and [Exercise 9](exercises.md#exercise-9-scribble-on-the-kernels-slot-table)
+demonstrates the fault.
+
+The PSRAM and flash windows are not usable for this. The flash window is not
+RAM, and PSRAM is unreachable only because `CONFIG_SPIRAM` is off — enabling it
+makes IDF describe that window with a locked R+W grant, which would hand U-mode
+access to the PSRAM heap rather than protect anything. (It does not currently
+boot on this board in any case; see `sdkconfig.defaults`.)
+
+Keep it in proportion. This is 1856 bytes of hardware-enforced protection in a
+system whose arenas — the thing users actually write to — are still shared
+DRAM, separated only by `user_range_ok()`. It closes one specific hole, not the
+gap.
 
 ### Closing the Gap
 

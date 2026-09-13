@@ -266,7 +266,28 @@ typedef struct
     bool umode_confirmed;
 } user_slot_t;
 
-static user_slot_t g_slots[USER_SLOTS];
+/* In TCM, deliberately, and this is the one piece of hardware-enforced memory
+ * protection in the project.
+ *
+ * Nothing else here is protected by the PMP: entry 5 grants U-mode read+write
+ * over the whole of internal DRAM, so a user with a wild pointer can reach the
+ * kernel's data and every other user's arena, and only user_range_ok() -- a
+ * software check -- stops the kernel being talked into doing it on a user's
+ * behalf.  TCM is different.  No PMP entry matches 30100000..30102000 at all,
+ * and PMP is default-deny for U-mode and default-allow for M-mode, so the
+ * kernel reaches it freely and U-mode cannot touch it however it tries.
+ *
+ * That matters most for the saved contexts, which live in these slots: without
+ * this, one user scribbling at random could corrupt another window's saved
+ * registers.  The boot report prints the address and says whether it landed
+ * inside TCM, and Exercise 9 demonstrates the fault.
+ *
+ * TCM is a single region shared by both cores, not a per-core alias like the
+ * CLIC, so an unpinned host task sees the same slot wherever it runs.  Eight
+ * slots is about 1.9 KiB of the 8 KiB available.
+ */
+
+static TCM_DRAM_ATTR user_slot_t g_slots[USER_SLOTS];
 
 static SemaphoreHandle_t g_console_mux;
 
@@ -862,6 +883,173 @@ static void user_host_task(void *arg)
 }
 
 /****************************************************************************
+ * Name: pmp_report
+ *
+ * Description:
+ *   Decode and print all sixteen PMP entries, then name the parts of the
+ *   memory map that no entry covers.
+ *
+ *   That last list is the interesting one and it is not obvious from the
+ *   entries themselves.  PMP is default-DENY for U-mode and default-allow for
+ *   M-mode: an address no entry matches is unreachable from U-mode and
+ *   perfectly reachable from the kernel.  Those ranges are therefore the only
+ *   memory on this board that U-mode cannot touch by hardware, which makes
+ *   them the one place kernel data can be put out of a user's reach without
+ *   unlocking anything -- see Documentation/isolation-limits.md.
+ *
+ ****************************************************************************/
+static void pmp_report(void)
+{
+    static const struct
+    {
+        const char *name;
+        uint32_t lo;
+        uint32_t hi;
+    } regions[] = {
+        { "internal SRAM", SOC_IRAM_LOW, SOC_IRAM_HIGH },
+        { "PSRAM window", SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH },
+        { "flash window", SOC_IROM_LOW, SOC_IROM_HIGH },
+        { "TCM", SOC_TCM_LOW, SOC_TCM_HIGH },
+        { "RTC / LP RAM", SOC_RTC_IRAM_LOW, SOC_RTC_IRAM_HIGH },
+        { "peripherals", SOC_PERIPHERAL_LOW, SOC_PERIPHERAL_HIGH },
+    };
+
+    static const char *const modes[] = { "OFF", "TOR", "NA4", "NAPOT" };
+
+    uint32_t lo[16];
+    uint32_t hi[16];
+    int n = 0;
+    int i;
+    int j;
+
+    kprintf("KERNEL: slot table at %08lx (%u bytes) -- %s\n", (unsigned long) (uintptr_t) g_slots, (unsigned) sizeof(g_slots), ((uintptr_t) g_slots >= SOC_TCM_LOW && (uintptr_t) g_slots + sizeof(g_slots) <= SOC_TCM_HIGH) ? "in TCM, which no PMP entry covers, so U-mode cannot reach it" : "NOT in TCM; U-mode can reach it");
+
+    kprintf("KERNEL: PMP entries:\n");
+
+    for (i = 0; i < 16; i++)
+    {
+        const uint32_t cfg = (umode_read_pmpcfg(i / 4) >> ((i % 4) * 8)) & 0xff;
+        const uint32_t addr = umode_read_pmpaddr(i);
+        const unsigned mode = (cfg >> 3) & 3;
+        uint32_t a = 0;
+        uint32_t b = 0;
+
+        if (mode == 1)                      /* TOR: [previous entry, this)  */
+        {
+            a = (i > 0) ? (umode_read_pmpaddr(i - 1) << 2) : 0;
+            b = addr << 2;
+        }
+        else if (mode == 2)                 /* NA4: exactly four bytes      */
+        {
+            a = addr << 2;
+            b = a + 4;
+        }
+        else if (mode == 3)                 /* NAPOT: size from trailing 1s */
+        {
+            const uint32_t inv = ~addr & (addr + 1);
+
+            a = (addr & ~(inv - 1)) << 2;
+            b = a + (inv << 3);
+        }
+
+        if (mode != 0 && b > a)
+        {
+            kprintf("KERNEL:   %2d %s %-5s %c%c%c %08lx..%08lx\n", i, (cfg & 0x80) ? "L" : "-", modes[mode], (cfg & 1) ? 'R' : '-', (cfg & 2) ? 'W' : '-', (cfg & 4) ? 'X' : '-', (unsigned long) a, (unsigned long) b);
+
+            lo[n] = a;
+            hi[n] = b;
+            n++;
+        }
+        else
+        {
+            /* An entry that matches nothing: disabled, or a TOR whose base
+             * and limit are the same address.
+             */
+
+            kprintf("KERNEL:   %2d %s %-5s --- matches nothing\n", i, (cfg & 0x80) ? "L" : "-", modes[mode]);
+        }
+    }
+
+    /* Sort and merge the covered ranges.  Sixteen entries, so the simplest
+     * sort that works is the right one.
+     */
+
+    for (i = 1; i < n; i++)
+    {
+        const uint32_t kl = lo[i];
+        const uint32_t kh = hi[i];
+
+        for (j = i - 1; j >= 0 && lo[j] > kl; j--)
+        {
+            lo[j + 1] = lo[j];
+            hi[j + 1] = hi[j];
+        }
+
+        lo[j + 1] = kl;
+        hi[j + 1] = kh;
+    }
+
+    for (i = 0, j = 0; i < n; i++)
+    {
+        if (j > 0 && lo[i] <= hi[j - 1])
+        {
+            if (hi[i] > hi[j - 1])
+            {
+                hi[j - 1] = hi[i];
+            }
+        }
+        else
+        {
+            lo[j] = lo[i];
+            hi[j] = hi[i];
+            j++;
+        }
+    }
+
+    n = j;
+
+    kprintf(
+        "KERNEL: no PMP entry matches these, so U-mode cannot reach them at\n"
+        "KERNEL:   all while the kernel still can:\n");
+
+    for (i = 0; i < (int) (sizeof(regions) / sizeof(regions[0])); i++)
+    {
+        uint32_t cur = regions[i].lo;
+        bool any = false;
+
+        for (j = 0; j < n && cur < regions[i].hi; j++)
+        {
+            if (hi[j] <= cur || lo[j] >= regions[i].hi)
+            {
+                continue;
+            }
+
+            if (lo[j] > cur)
+            {
+                kprintf("KERNEL:   %-14s %08lx..%08lx (%lu KiB)\n", regions[i].name, (unsigned long) cur, (unsigned long) lo[j], (unsigned long) ((lo[j] - cur) / 1024));
+                any = true;
+            }
+
+            if (hi[j] > cur)
+            {
+                cur = hi[j];
+            }
+        }
+
+        if (cur < regions[i].hi)
+        {
+            kprintf("KERNEL:   %-14s %08lx..%08lx (%lu KiB)\n", regions[i].name, (unsigned long) cur, (unsigned long) regions[i].hi, (unsigned long) ((regions[i].hi - cur) / 1024));
+            any = true;
+        }
+
+        if (!any)
+        {
+            kprintf("KERNEL:   %-14s -- fully covered, U-mode reaches all of it\n", regions[i].name);
+        }
+    }
+}
+
+/****************************************************************************
  * Name: boot_report
  *
  * Description:
@@ -880,6 +1068,8 @@ static void boot_report(void)
     kprintf("=== ESP32-P4 protected-mode demo: M-mode kernel, U-mode user ===\n");
     kprintf("KERNEL: mstatus=%08lx mtvec=%08lx mintstatus=%08lx\n", (unsigned long) umode_read_mstatus(), (unsigned long) umode_read_mtvec(), (unsigned long) umode_read_mintstatus());
     kprintf("KERNEL: pmpcfg 0=%08lx 1=%08lx 2=%08lx 3=%08lx\n", (unsigned long) umode_read_pmpcfg(0), (unsigned long) umode_read_pmpcfg(1), (unsigned long) umode_read_pmpcfg(2), (unsigned long) umode_read_pmpcfg(3));
+
+    pmp_report();
     kprintf(
         "KERNEL: IRAM text ends at %08lx; PMP entry 4 grants U-mode R+X "
         "below it\n",

@@ -18,3 +18,31 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_INT_WDT=n
 CONFIG_ESP_TASK_WDT_INIT=n
 CONFIG_BOOTLOADER_WDT_ENABLE=n
+
+# External PSRAM: NOT ENABLED, and not for want of trying.
+#
+# The Tab5 has PSRAM and this project would like to use it, but CONFIG_SPIRAM=y
+# does not boot on this board.  The second-stage bootloader panics immediately
+# after "Multicore bootloader" with a Store/AMO access fault on 0x5008e380 --
+# a register of SPIMEM2, the controller that drives PSRAM.  Identical fault at
+# 200 MHz and at 80 MHz, and at the same address, so it is not a timing or
+# speed problem: the access to the controller itself does not complete.
+#
+# This is pre-rev3 silicon (v1.0, see CONFIG_ESP32P4_SELECTS_REV_LESS_V3 above)
+# and IDF v5.5.4's P4 PSRAM support is written for rev3 -- its one P4-specific
+# workaround is compiled out precisely when that option is set, and the build
+# uses the hw_ver1 register definitions rather than hw_ver3.  Treat PSRAM as
+# unavailable here until either the silicon or IDF's support for it changes.
+#
+# The consequence is visible in the boot report: with SPIRAM off, IDF never
+# programs PMP entries for the external RAM window, so the whole 64 MiB of it
+# has no matching entry and U-mode cannot reach it at all.
+#
+# AND IF YOU DO TRY IT: the board does not recover by itself.  After the failed
+# PSRAM bring-up the SAME bootloader fault kept happening with SPIRAM off again,
+# from a clean rebuild, with an sdkconfig byte-identical to the one that had
+# worked minutes earlier -- and in a bootloader containing none of this
+# project's code.  Reflashing does not help and neither does a reset over RTS:
+# PSRAM VDD comes from the MPLL LDO domain (SOC_PSRAM_VDD_POWER_MPLL) and the
+# half-configured state survives an EN reset.  Pull the USB lead out and put it
+# back in.  The board comes straight back.

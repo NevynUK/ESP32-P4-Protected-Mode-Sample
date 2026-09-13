@@ -204,6 +204,7 @@ uint32_t umode_read_mstatus(void);
 uint32_t umode_read_mtvec(void);
 uint32_t umode_read_mintstatus(void);
 uint32_t umode_read_pmpcfg(uint32_t idx);
+uint32_t umode_read_pmpaddr(uint32_t idx);
 
 #endif /* __ASSEMBLER__ */
 #endif /* __UMODE_H */
