@@ -266,7 +266,28 @@ typedef struct
     bool umode_confirmed;
 } user_slot_t;
 
-static user_slot_t g_slots[USER_SLOTS];
+/* In TCM, deliberately, and this is the one piece of hardware-enforced memory
+ * protection in the project.
+ *
+ * Nothing else here is protected by the PMP: entry 5 grants U-mode read+write
+ * over the whole of internal DRAM, so a user with a wild pointer can reach the
+ * kernel's data and every other user's arena, and only user_range_ok() -- a
+ * software check -- stops the kernel being talked into doing it on a user's
+ * behalf.  TCM is different.  No PMP entry matches 30100000..30102000 at all,
+ * and PMP is default-deny for U-mode and default-allow for M-mode, so the
+ * kernel reaches it freely and U-mode cannot touch it however it tries.
+ *
+ * That matters most for the saved contexts, which live in these slots: without
+ * this, one user scribbling at random could corrupt another window's saved
+ * registers.  The boot report prints the address and says whether it landed
+ * inside TCM, and Exercise 9 demonstrates the fault.
+ *
+ * TCM is a single region shared by both cores, not a per-core alias like the
+ * CLIC, so an unpinned host task sees the same slot wherever it runs.  Eight
+ * slots is about 1.9 KiB of the 8 KiB available.
+ */
+
+static TCM_DRAM_ATTR user_slot_t g_slots[USER_SLOTS];
 
 static SemaphoreHandle_t g_console_mux;
 
@@ -900,6 +921,8 @@ static void pmp_report(void)
     int n = 0;
     int i;
     int j;
+
+    kprintf("KERNEL: slot table at %08lx (%u bytes) -- %s\n", (unsigned long) (uintptr_t) g_slots, (unsigned) sizeof(g_slots), ((uintptr_t) g_slots >= SOC_TCM_LOW && (uintptr_t) g_slots + sizeof(g_slots) <= SOC_TCM_HIGH) ? "in TCM, which no PMP entry covers, so U-mode cannot reach it" : "NOT in TCM; U-mode can reach it");
 
     kprintf("KERNEL: PMP entries:\n");
 
