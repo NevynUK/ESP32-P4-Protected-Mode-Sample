@@ -22,8 +22,8 @@ It is written to be worked through, not skimmed. The order is deliberate:
    is built out of.
 3. **[Part 2: Reading the Code](#part-2--reading-the-code)** — a route through
    the source, with what to look for in each file.
-4. **[Part 3: Five Things That Do Not Work the Obvious
-   Way](#part-3--five-things-that-do-not-work-the-obvious-way)** — the real
+4. **[Part 3: Six Things That Do Not Work the Obvious
+   Way](#part-3--six-things-that-do-not-work-the-obvious-way)** — the real
    content. Each is a bug that was hit, diagnosed and fixed in this tree, and
    each teaches something the datasheet does not tell you.
 5. **[Part 4: Exercises](#part-4--exercises)** — break it deliberately. Most
@@ -170,11 +170,12 @@ So U-mode is not a task. A perfectly ordinary FreeRTOS task **hosts** it:
 ```
 user_host_task (M-mode, FreeRTOS, pinned to one core)
     |
-    +-- umode_enter(&slot->ctx) ------------.
-    |     save kernel regs, mtvec, mtvt     |
-    |     mask interrupts (CLIC threshold)   |
-    |     hand the stack guard over          |
-    |     mret, MPP=U                        v
+    +-- umode_enter(&slot->ctx) -----------.
+    |     save kernel regs and mstatus     |
+    |     mask interrupts (MIE, then CLIC) |
+    |     snapshot the per-hart CSRs       |
+    |     hand the stack guard over        |
+    |     mret, MPP=U                      v
     |                                    user_main(id)   (U-mode)
     |                                        |
     |     <--- umode_trap_entry <---------- ecall / fault / interrupt
@@ -252,12 +253,18 @@ Not per-hart, therefore work:
 `"ax"` and `"a"`, so it holds no writable state and both cores execute the same
 window code re-entrantly.
 
-**Each host task must stay pinned** for the length of its window.
-`umode_enter()` snapshots per-hart CSRs *before* it masks interrupts, so an
-unpinned task could be migrated between the snapshot and the restore and would
-put core A's vectors back on core B. `configASSERT(xPortGetCoreID() ==
-u->core)` checks the pin rather than assuming it. Which core each window runs
-on is free — `USER_CORE(n)` in `kernel_main.c` is the mapping.
+**A window cannot span two cores**, and it does not need a pin to guarantee
+that. `umode_enter()` takes `mstatus.MIE` down *before* it snapshots any
+per-hart CSR, so from there to the closing `mret` the hart cannot be preempted
+and every hart-specific value is read and restored on the same core. Before
+that ordering was fixed the snapshot came first, and a tick landing in the gap
+could migrate the task and put core A's vectors back on core B — which is why
+the host tasks used to have to be pinned.
+
+They are still pinned, but now as a choice rather than a requirement: it keeps
+the console output in a predictable order. `configASSERT(xPortGetCoreID() ==
+u->core)` checks that the pin took effect, and `USER_CORE(n)` in
+`kernel_main.c` is the mapping. Not pinning them at all also works.
 
 Kernel-side state is per-slot for the same reason. `user_slot_t` carries each
 window's name, id, core, arena, context, run flag and counters; two host tasks
@@ -327,7 +334,7 @@ out, so a user that clobbers them cannot hurt the kernel.
 
 ---
 
-# Part 3 — Five Things That Do Not Work the Obvious Way
+# Part 3 — Six Things That Do Not Work the Obvious Way
 
 Each of these was a real bug in this tree. They are the reason the code is
 shaped the way it is, and they are the most transferable content here.
@@ -488,6 +495,72 @@ This is the clearest trade-off in the tree, and a good one to argue about: it is
 a real reduction in the safety net, accepted to get a second unprivileged
 execution context. A design that only ever wanted one window should keep the
 single-window behaviour.
+
+## 3.6 Per-Hart State Must Be Snapshotted Behind the Mask
+
+`umode_enter()` borrows the kernel's `mtvec`, `mtvt`, `mscratch` and
+`mintstatus` for the length of the window and puts them back on the way out.
+All four are **per-hart**. The obvious order is to save them, then mask
+interrupts, then go — and that order is wrong, because the save is exposed to
+preemption. A scheduler tick landing between the save and the mask can move
+the task to the other core, and the trap vector will then faithfully restore
+one hart's values into a different one.
+
+`mintstatus` is the one that would bite hardest: its `mil` field is the live
+CLIC interrupt level, and the exit path folds it into `mcause.mpil` for the
+`mret` to restore ([3.3](#33-mcause-aliases-mstatusmpp)). `mtvec` and `mtvt`
+survive by luck, because ESP-IDF programs both cores identically, and IDF does
+not use `mscratch` on this target at all.
+
+The fix is an ordering, not a mechanism. `mstatus` is read first, because the
+exit path needs the caller's `MIE` bit and the `csrci` is about to clear it —
+and that one read *is* safe early, since `MIE` is set on whichever hart a
+running task is on, so the value does not depend on where it was sampled.
+Everything else is read below the mask. The whole of the exposed prologue is
+now the stack frame, the callee-saved registers going to the task's **own**
+stack, and one `csrr`:
+
+```
+4ff0173c:  sw     s11,56(sp)
+4ff01740:  csrr   t0,mstatus
+4ff01744:  sw     t0,156(a0)
+4ff01748:  csrci  mstatus,8      <- everything hart-specific happens below here
+```
+
+The exit path stops rebuilding `mstatus` from the snapshot for the same
+reason, and for one more. It takes the base from a live `csrr` on the hart it
+is returning to, using only the `MIE` bit of the saved copy. `mstatus` carries
+the coprocessor dirty bits `FS` and `VS`, and this SoC has an FPU: writing a
+pre-window copy back would tell the kernel the state was still clean when
+U-mode may have dirtied it. That is a bug even when nothing migrates.
+
+**How often does it actually happen?** Often enough to matter, and it took some
+work to find out. The exposed prologue is four instructions, so for a long time
+it looked unreachable — millions of windows with no migration ever landing in
+it. Two things turned out to be true:
+
+| Load | Migrations Landing in the Prologue |
+|---|---|
+| One runnable task per core | none, over millions of windows |
+| Cores oversubscribed | 474 in 45 s |
+
+With one runnable task per core the placement is stable and preemption simply
+puts a task back where it was. Oversubscribe the cores — one U-mode window
+pinned, another floating, one spare runnable task — and the same four
+instructions are hit hundreds of times a minute.
+
+**And what does it cost when it happens?** Today, nothing observable. A probe
+that forces the race shows the corruption arriving reliably — every mid-call
+migration under the old ordering captures the wrong hart's state — and the
+system carries on regardless, because `mtvec` and `mtvt` match across cores,
+`mscratch` is unused, and `mintstatus.mil` is zero in task context. Those are
+three ESP-IDF implementation details, not three guarantees, which is the whole
+argument for fixing the order rather than relying on them.
+
+It is worth being clear that this is the one entry in Part 3 that never
+produced a crash. It earns its place because the failure it prevents is silent:
+the wrong value is restored, everything keeps running, and nothing anywhere
+says so.
 
 ---
 
@@ -811,6 +884,23 @@ Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
   `UCTX_*` offsets `umode.S` uses. `kernel_main.c` `_Static_assert`s every field,
   because the failure mode otherwise is a wild store inside a trap vector.
 
+- **Only core 0 runs the full FreeRTOS tick.** ESP-IDF's
+  `xTaskIncrementTick()` opens with
+  `configASSERT( portGET_CORE_ID() == 0 )`, so core 0 alone walks the
+  delayed-task list *and* applies the time-slice rotation. Two consequences
+  bite anyone writing per-core code here: a task that blocks is almost always
+  woken onto core 0, so a sleeping workload quietly herds itself onto one core;
+  and whatever is running on core 1 is not rotated off by a tick. Both look
+  like bugs in your own code when you first meet them.
+
+- **`app_main` runs at priority 1.** Creating a task above that which never
+  blocks preempts the rest of your initialisation permanently, and any task you
+  meant to create afterwards simply never exists. The symptom looks exactly
+  like scheduler starvation — a task that produces no output and no
+  counters — and the giveaway is that its *creation-time* log line is missing
+  too. Raise your own priority for the duration of the setup if you create
+  tasks that spin.
+
 - **`soc_caps.h` must be included in `umode.S`** for IDF's `_CUR_CORE` macros to
   dispatch on `mhartid` at all. Without it they silently collapse to their
   core-0 variants — and the failure mode is not a crash but a *silently
@@ -854,7 +944,7 @@ had to be.
 **Read the status line on that repo before treating it as authority.** It is
 titled a *proposal* for a Core-Local Interrupt Controller, and it is not a
 ratified RISC-V extension. That is the honest explanation for a good deal of
-what [Part 3](#part-3--five-things-that-do-not-work-the-obvious-way) documents:
+what [Part 3](#part-3--six-things-that-do-not-work-the-obvious-way) documents:
 the P4 implements a moving target, so `mintstatus` sits at `0x346` rather than
 `0xfb1`, the interrupt threshold is a memory-mapped register rather than a CSR,
 and `mcause` carries fields ([3.3](#33-mcause-aliases-mstatusmpp)) that no
