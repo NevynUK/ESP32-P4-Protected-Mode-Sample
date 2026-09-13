@@ -144,6 +144,8 @@
 
 #include "esp_attr.h"
 #include "esp_rom_sys.h"
+#include "esp_heap_caps.h"
+#include "esp_ipc.h"
 #include "soc/assist_debug_reg.h"
 #include "soc/clic_reg.h"
 #include "soc/interrupts.h"
@@ -219,7 +221,10 @@
  * object with its own bounds, which is what user_range_ok() checks against.
  */
 
-static uint8_t g_user_arenas[USER_SLOTS][USER_ARENA_SIZE] __attribute__((aligned(16)));
+/* The arenas are allocated from PSRAM at start-up rather than being static
+ * arrays in internal .bss.  There are 32 MB of it and the users are the only
+ * thing that needs to grow.
+ */
 
 /* Names live here rather than as string literals because the slots are built
  * in a loop now; "user0".."user7" at eight slots.
@@ -883,6 +888,24 @@ static void user_host_task(void *arg)
 }
 
 /****************************************************************************
+ * Name: grant_extram_to_umode
+ *
+ * Description:
+ *   Hand U-mode the whole external RAM window.
+ *
+ *   Called on each core because pmpaddr and pmpcfg are per-hart, so a grant
+ *   made on core 0 means nothing on core 1 -- and with unpinned host tasks a
+ *   window runs on whichever core the scheduler picked.
+ *
+ ****************************************************************************/
+static void grant_extram_to_umode(void *arg)
+{
+    (void) arg;
+
+    umode_pmp_grant_extram(SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH);
+}
+
+/****************************************************************************
  * Name: pmp_report
  *
  * Description:
@@ -1168,14 +1191,34 @@ void kernel_main(void)
 
 #endif
 
+    /* Open the external RAM window to U-mode, on both cores.  This has to
+     * happen before any window runs, because the arenas below live there.
+     */
+
+    grant_extram_to_umode(NULL);
+
+    for (int core = 0; core < SOC_CPU_CORES_NUM; core++)
+    {
+        if (core != xPortGetCoreID())
+        {
+            ESP_ERROR_CHECK(esp_ipc_call_blocking(core, grant_extram_to_umode, NULL));
+        }
+    }
+
     for (int i = 0; i < USER_SLOTS; i++)
     {
         snprintf(g_slot_names[i], sizeof(g_slot_names[i]), "user%d", i);
 
         g_slots[i].name = g_slot_names[i];
         g_slots[i].id = (uint32_t) i;
-        g_slots[i].arena = g_user_arenas[i];
-        g_slots[i].arena_size = sizeof(g_user_arenas[i]);
+
+        /* Out of PSRAM, not internal .bss.  16-byte aligned because the user's
+         * stack starts at the top of it and the ABI wants that alignment.
+         */
+
+        g_slots[i].arena = heap_caps_aligned_alloc(16, USER_ARENA_SIZE, MALLOC_CAP_SPIRAM);
+        configASSERT(g_slots[i].arena != NULL);
+        g_slots[i].arena_size = USER_ARENA_SIZE;
     }
 
     boot_report();

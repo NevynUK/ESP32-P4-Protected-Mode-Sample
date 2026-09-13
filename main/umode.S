@@ -866,6 +866,54 @@ umode_read_pmpaddr:
   ret
   .size umode_read_pmpaddr, .-umode_read_pmpaddr
 
+/****************************************************************************
+ * Name: umode_pmp_grant_extram
+ *
+ * Description:
+ *   void umode_pmp_grant_extram(uint32_t lo, uint32_t hi)
+ *
+ *   Give U-mode read+write over [lo, hi) using PMP entries 9 and 10, as a TOR
+ *   pair: entry 9 carries the base address with its mode OFF so that it grants
+ *   nothing itself, and entry 10 spans from there to its own address.
+ *
+ *   Those two entries are the only ones on this part that can still be used.
+ *   Everything IDF programs is locked, and entries 9 and 10 are shadowed for
+ *   internal DRAM because entry 5 already matches those addresses and the
+ *   lowest matching entry decides.  Nothing matches a PSRAM address, though,
+ *   so for that window entry 9 is the first match and these two are free.
+ *
+ *   NEITHER IS LOCKED, deliberately.  A PMP entry always applies to U-mode;
+ *   the lock bit only decides whether it also applies to M-mode.  Left
+ *   unlocked, this grants U-mode the window and leaves the kernel's own access
+ *   exactly as it was.
+ *
+ *   Must run on both harts: pmpaddr and pmpcfg are per-hart CSRs.
+ *
+ ****************************************************************************/
+
+  .balign 4
+  .global umode_pmp_grant_extram
+  .type   umode_pmp_grant_extram, @function
+umode_pmp_grant_extram:
+  srli  t0, a0, 2
+  csrw  pmpaddr9, t0             /* base of the TOR range                  */
+  srli  t0, a1, 2
+  csrw  pmpaddr10, t0            /* limit                                  */
+
+  /* pmpcfg2 holds entries 8..11, one byte each, entry 8 in the low byte.
+   * Rewrite bytes 1 and 2 only; 8 and 11 are locked and would ignore a write
+   * anyway, but there is no reason to aim one at them.
+   */
+
+  csrr  t0, pmpcfg2
+  li    t1, 0xff0000ff           /* keep entries 8 and 11                  */
+  and   t0, t0, t1
+  li    t1, 0x000b0000           /* entry 10: A=TOR(1)<<3 | W | R          */
+  or    t0, t0, t1               /* entry 9 stays 0: OFF, grants nothing   */
+  csrw  pmpcfg2, t0
+  ret
+  .size umode_pmp_grant_extram, .-umode_pmp_grant_extram
+
   .option pop
 
 /****************************************************************************
