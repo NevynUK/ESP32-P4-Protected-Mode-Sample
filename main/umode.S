@@ -207,6 +207,36 @@ umode_enter:
    * state to put back.
    */
 
+  /* mstatus comes first, and it is the ONLY one read with interrupts still
+   * enabled.  The exit path needs the caller's MIE bit, which the csrci below
+   * is about to clear, so there is no way to take it later.  That is safe
+   * under migration in a way the others are not: MIE is 1 on whichever hart a
+   * running task is on, so a snapshot taken on one core is still true on the
+   * other.  Only the MIE bit of this value is used -- see the exit path, which
+   * takes every other bit from the hart it is actually returning to.
+   */
+
+  csrr  t0, mstatus
+  sw    t0, UCTX_K_MSTATUS(a0)
+
+  /* Close the window BEFORE snapshotting anything else: no M-mode interrupt
+   * from here to the mret, so no scheduler tick, so no migration.
+   *
+   * The ordering is load-bearing and it is why an unpinned host task is safe.
+   * mtvec, mtvt, mscratch and mintstatus are all PER-HART.  Read before this
+   * csrci, a tick landing in the gap could migrate the task and leave the
+   * context holding the OLD hart's values -- which the trap vector would then
+   * restore into the new hart on the way out.  mintstatus is the one that
+   * really bites: its mil field is the live CLIC interrupt level, genuinely
+   * different between cores, and the exit path folds it into mcause.mpil for
+   * the mret to restore.  mtvec and mtvt happen to hold the same value on both
+   * cores because IDF programs them identically, and IDF does not use
+   * mscratch here at all, so those three would survive by luck rather than by
+   * design.  Below the csrci nothing can move, so none of it is luck.
+   */
+
+  csrci mstatus, MSTATUS_MIE
+
   csrr  t0, mtvec
   sw    t0, UCTX_K_MTVEC(a0)
   csrr  t0, CSR_MTVT
@@ -215,16 +245,7 @@ umode_enter:
   sw    t0, UCTX_K_MSCRATCH(a0)
   csrr  t0, CSR_MINTSTATUS
   sw    t0, UCTX_K_MINTSTATUS(a0)
-  csrr  t0, mstatus
-  sw    t0, UCTX_K_MSTATUS(a0)
   sw    sp, UCTX_K_SP(a0)
-
-  /* Close that window: no M-mode interrupt from here to the mret.  The
-   * caller's MIE is in the saved mstatus and comes back through the return
-   * path's mret, which restores it from mstatus.MPIE.
-   */
-
-  csrci mstatus, MSTATUS_MIE
 
   /* Keep interrupts out of the U-mode window entirely, by raising the CLIC
    * threshold.  Two reasons this is done rather than letting them land:
@@ -632,12 +653,30 @@ umode_trap_entry:
   or    t0, t0, t2
   csrw  mcause, t0
 
-  /* mstatus: the kernel's, with MPP = M and MPIE = the kernel's MIE.  Written
+  /* mstatus: THIS hart's, with MPP = M and MPIE = the kernel's MIE.  Written
    * last so it, not mcause, decides the privilege.
+   *
+   * The base comes from a fresh csrr rather than from the saved copy, and only
+   * the MIE bit is taken from the snapshot.  Two reasons, and the second is
+   * the one that matters for an unpinned host task:
+   *
+   *  - mstatus carries the coprocessor dirty state, FS and VS, and this SoC
+   *    has an FPU (SOC_CPU_HAS_FPU).  If U-mode dirtied it, writing the
+   *    pre-window copy back would tell the kernel it was still clean and the
+   *    state could be dropped at the next context switch.  The live value is
+   *    the truthful one.
+   *  - FS and VS are per-hart.  Restoring a snapshot taken on another core
+   *    would plant that core's coprocessor state here.  With the prologue
+   *    reordered the snapshot can no longer come from another core, so this is
+   *    belt and braces -- but it costs one instruction and removes a reason to
+   *    care where the snapshot came from.
+   *
+   * t3 is dead here: the mcause build above finished with it.
    */
 
+  csrr  t3, mstatus
   li    t0, ~(MSTATUS_MPP | MSTATUS_MPIE | MSTATUS_MIE)
-  and   t0, t1, t0
+  and   t0, t3, t0
   li    t2, MSTATUS_MPP          /* MPP = 3 = M */
   or    t0, t0, t2
   andi  t2, t1, MSTATUS_MIE

@@ -174,10 +174,14 @@
  * mhartid, and umode.S has no writable data of its own -- its only sections are
  * "ax" and "a" -- so both cores run the same window code re-entrantly.
  *
- * Each host task must stay pinned for the length of its window: umode_enter()
- * snapshots per-hart CSRs before it masks interrupts, so an unpinned host task
- * could be migrated between the snapshot and the restore.  WHICH core each one
- * is pinned to is free.
+ * A window cannot span two cores, but it no longer needs a pin to guarantee
+ * that: umode_enter() takes mstatus.MIE down before it snapshots any per-hart
+ * CSR, so from that point to the closing mret the hart cannot be preempted and
+ * everything hart-specific is both read and restored on the same core.  The
+ * host tasks are still pinned here, but that is now a choice -- it keeps the
+ * console output in a predictable order and makes the demo easier to reason
+ * about -- rather than a correctness requirement.  WHICH core each one is
+ * pinned to is free, and so is not pinning them at all.
  *
  * The kernel task is pinned to USER_CORE(0) only to keep the console output in
  * a predictable order.

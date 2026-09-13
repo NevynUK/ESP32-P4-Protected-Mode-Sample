@@ -252,12 +252,18 @@ Not per-hart, therefore work:
 `"ax"` and `"a"`, so it holds no writable state and both cores execute the same
 window code re-entrantly.
 
-**Each host task must stay pinned** for the length of its window.
-`umode_enter()` snapshots per-hart CSRs *before* it masks interrupts, so an
-unpinned task could be migrated between the snapshot and the restore and would
-put core A's vectors back on core B. `configASSERT(xPortGetCoreID() ==
-u->core)` checks the pin rather than assuming it. Which core each window runs
-on is free — `USER_CORE(n)` in `kernel_main.c` is the mapping.
+**A window cannot span two cores**, and it does not need a pin to guarantee
+that. `umode_enter()` takes `mstatus.MIE` down *before* it snapshots any
+per-hart CSR, so from there to the closing `mret` the hart cannot be preempted
+and every hart-specific value is read and restored on the same core. Before
+that ordering was fixed the snapshot came first, and a tick landing in the gap
+could migrate the task and put core A's vectors back on core B — which is why
+the host tasks used to have to be pinned.
+
+They are still pinned, but now as a choice rather than a requirement: it keeps
+the console output in a predictable order. `configASSERT(xPortGetCoreID() ==
+u->core)` checks that the pin took effect, and `USER_CORE(n)` in
+`kernel_main.c` is the mapping. Not pinning them at all also works.
 
 Kernel-side state is per-slot for the same reason. `user_slot_t` carries each
 window's name, id, core, arena, context, run flag and counters; two host tasks
