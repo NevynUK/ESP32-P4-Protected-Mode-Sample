@@ -212,5 +212,12 @@ uint32_t umode_read_pmpaddr(uint32_t idx);
 
 void umode_pmp_grant_extram(uint32_t lo, uint32_t hi);
 
+/* Write all sixteen PMP entries.  addr[] values are pre-shifted right by two;
+ * cfg[] is the four packed pmpcfg words.  Per-hart: call it on every core, and
+ * only useful while the entries are unlocked.
+ */
+
+void umode_pmp_program(const uint32_t addr[16], const uint32_t cfg[4]);
+
 #endif /* __ASSEMBLER__ */
 #endif /* __UMODE_H */

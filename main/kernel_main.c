@@ -888,21 +888,104 @@ static void user_host_task(void *arg)
 }
 
 /****************************************************************************
- * Name: grant_extram_to_umode
+ * Name: pmp_apply
  *
  * Description:
- *   Hand U-mode the whole external RAM window.
+ *   Program the PMP from scratch, describing what U-mode may touch.
  *
- *   Called on each core because pmpaddr and pmpcfg are per-hart, so a grant
- *   made on core 0 means nothing on core 1 -- and with unpinned host tasks a
- *   window runs on whichever core the scheduler picked.
+ *   This project takes the PMP over rather than living with IDF's, which is
+ *   what CONFIG_BOOTLOADER_REGION_PROTECTION_ENABLE=n is for: with it off,
+ *   esp_cpu_configure_region_protection() never runs and the PMP is left in
+ *   its reset state.  That is the right place to start from -- every entry
+ *   OFF, and PMP is default-DENY for U-mode and default-allow for M-mode, so
+ *   U-mode begins with access to NOTHING and this function hands back only
+ *   what it needs.  IDF's configuration could not be worked with instead: it
+ *   locks every entry it programs, and one of them grants U-mode read and
+ *   write over the whole of internal DRAM.
+ *
+ *   Nothing here is locked, deliberately.  A PMP entry always applies to
+ *   U-mode; the lock bit only decides whether it also applies to M-mode.  Left
+ *   unlocked these constrain the user and leave the kernel's access alone,
+ *   which is what lets the kernel keep reaching memory U-mode cannot.
+ *
+ *   Per-hart, so this runs on every core.
  *
  ****************************************************************************/
-static void grant_extram_to_umode(void *arg)
+
+#define PMP_R      (1u << 0)
+#define PMP_W      (1u << 1)
+#define PMP_X      (1u << 2)
+#define PMP_A_TOR  (1u << 3)
+
+static void pmp_apply(void *arg)
 {
+    const uint32_t iram_text_end = (uint32_t) (uintptr_t) &_iram_text_end;
+
+    uint32_t addr[16] = { 0 };
+    uint32_t cfg[4] = { 0 };
+    uint8_t byte[16] = { 0 };
+    int i;
+
     (void) arg;
 
-    umode_pmp_grant_extram(SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH);
+    /* A TOR entry spans from the PREVIOUS entry's address to its own, so each
+     * range costs two entries: one holding the base with its mode OFF, which
+     * grants nothing by itself, and one carrying the limit and permissions.
+     */
+
+    /* [SOC_IRAM_LOW, _iram_text_end) -- the code U-mode executes.  Still the
+     * whole of IRAM text rather than only the user's functions; narrowing it
+     * needs the user's code in a section of its own.
+     */
+
+    addr[0] = SOC_IRAM_LOW >> 2;
+    addr[1] = iram_text_end >> 2;
+    byte[1] = PMP_A_TOR | PMP_R | PMP_X;
+
+    /* [_iram_text_end, SOC_DRAM_HIGH) -- internal data.  Still all of it, so
+     * this is not yet a split: it reproduces what IDF granted, so that taking
+     * the PMP over can be verified on its own before the policy changes.
+     */
+
+    addr[2] = SOC_DRAM_HIGH >> 2;
+    byte[2] = PMP_A_TOR | PMP_R | PMP_W;
+
+    /* [SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH) -- all 32 MB of PSRAM, where the user
+     * arenas live.
+     */
+
+    addr[3] = SOC_EXTRAM_LOW >> 2;
+    addr[4] = SOC_EXTRAM_HIGH >> 2;
+    byte[4] = PMP_A_TOR | PMP_R | PMP_W;
+
+    /* Everything else stays OFF, so U-mode cannot reach it: the peripherals,
+     * RTC RAM and ROM that IDF used to grant, and TCM, which it never did.
+     */
+
+    for (i = 0; i < 16; i++)
+    {
+        cfg[i / 4] |= (uint32_t) byte[i] << ((i % 4) * 8);
+    }
+
+    umode_pmp_program(addr, cfg);
+}
+
+/****************************************************************************
+ * Name: pmp_apply_all_cores
+ ****************************************************************************/
+static void pmp_apply_all_cores(void)
+{
+    int core;
+
+    pmp_apply(NULL);
+
+    for (core = 0; core < SOC_CPU_CORES_NUM; core++)
+    {
+        if (core != xPortGetCoreID())
+        {
+            ESP_ERROR_CHECK(esp_ipc_call_blocking(core, pmp_apply, NULL));
+        }
+    }
 }
 
 /****************************************************************************
@@ -1191,19 +1274,9 @@ void kernel_main(void)
 
 #endif
 
-    /* Open the external RAM window to U-mode, on both cores.  This has to
-     * happen before any window runs, because the arenas below live there.
-     */
+    /* Describe the world to U-mode, on every core, before any window runs. */
 
-    grant_extram_to_umode(NULL);
-
-    for (int core = 0; core < SOC_CPU_CORES_NUM; core++)
-    {
-        if (core != xPortGetCoreID())
-        {
-            ESP_ERROR_CHECK(esp_ipc_call_blocking(core, grant_extram_to_umode, NULL));
-        }
-    }
+    pmp_apply_all_cores();
 
     for (int i = 0; i < USER_SLOTS; i++)
     {
