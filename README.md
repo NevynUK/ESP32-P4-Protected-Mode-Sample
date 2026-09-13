@@ -22,7 +22,8 @@ It is written to be worked through, not skimmed. The order is deliberate:
 2. **[Part 1: The Concepts](#part-1--the-concepts)** — the four ideas the code
    is built out of.
 3. **[Part 2: Reading the Code](#part-2--reading-the-code)** — a route through
-   the source, with what to look for in each file.
+   the source, what to look for in each file, and how to
+   [add a syscall](#adding-a-syscall) of your own.
 4. **[Part 3: Six Things That Do Not Work the Obvious
    Way](#part-3--six-things-that-do-not-work-the-obvious-way)** — the real
    content. Each is a bug that was hit, diagnosed and fixed in this tree, and
@@ -356,6 +357,88 @@ chose it. In the current build it does not — the constants are reached
 PC-relative (`addi a2,a2,-1336`), and no user function references `gp` at all.
 Either way both registers are saved on the kernel frame and restored on the way
 out, so a user that clobbers them cannot hurt the kernel.
+
+## Adding a Syscall
+
+Three edits, in three files. `SYS_GETCORE` is the whole worked example, because
+it is about six lines end to end.
+
+**1. Give it a number** — `main/syscall.h`:
+
+```c
+#define SYS_GETCORE    5    /* -> the core this window is running on        */
+```
+
+**2. Implement it** — the `switch` in `syscall_dispatch()`, `main/kernel_main.c`:
+
+```c
+case SYS_GETCORE:
+    ret = (uint32_t) xPortGetCoreID();
+    break;
+```
+
+This runs in the host task, in M-mode, with the window closed — so blocking is
+legal here and `SYS_DELAY_MS` really is a `vTaskDelay()`. That is the whole
+reason the trap vector does no dispatching ([1.2](#12-u-mode-is-not-a-task-it-is-a-coroutine-hosted-by-one)).
+
+**3. Call it** — from `user_main.c`:
+
+```c
+pos = u_append_u32(msg, pos, u_syscall0(SYS_GETCORE));
+```
+
+There is no third step for registration. There is no dispatch table.
+
+### Three Rules That Are Easy to Get Wrong
+
+**Validate every pointer against the calling slot.**
+`user_range_ok(u, addr, len)` — `u`, not a global arena. PMP entry 5 grants
+U-mode *all* of DRAM ([Part 5](#part-5--the-limit-of-the-isolation-stated-plainly)),
+so this check is the only thing keeping the eight users out of each other's
+memory. Use `user_strlen(u, addr, max)` for strings.
+
+**`break` and `return false` are the recoverable/fatal decision.** `break` falls
+through to the tail, which steps `pc` past the `ecall` and writes `ret` into the
+user's `a0`; the user carries on. `return false` retires the context. A bad
+pointer should be recoverable — `ret = SYS_ERR_FAULT; break;` — because a user
+passing rubbish is a bug in the user, not a privilege violation. Only `SYS_EXIT`
+and real faults are fatal.
+
+**You cannot return a string.** The return value is one register. Anything
+larger has to be copied into a buffer the caller owns, whose pointer and length
+you validated — `SYS_PUTS` in reverse.
+
+### Limits
+
+| Limit | Value | If you need more |
+|---|---|---|
+| Arguments | **2** (`u_syscall0/1/2`) | Write `u_syscall3` in `user_syscall.S` and read `ctx->x[12]` in the dispatcher |
+| Arguments, ABI ceiling | **7** (`a0`–`a6`) | `a7` carries the number, so past `a6` you are out of registers — pass a struct in the arena instead |
+| Return value | one `uint32_t`, in `a0` | An out-pointer into the caller's arena |
+| Syscall number | `a7`, any `uint32_t` | — |
+| `SYS_PUTS` message | `SYS_PUTS_MAX`, 128 bytes | Raise it, or use `SYS_WRITE`, which is counted and unbounded |
+
+**On the argument count:** the stubs take the number in `a0` and shift the
+arguments down one register, so `u_syscall2(nr, x, y)` arrives as `a7=nr`,
+`a0=x`, `a1=y`. A stub for seven arguments has to move `a7` out of the way
+*before* overwriting it with the number, via a scratch register — the naive
+`mv a7, a0` first would destroy the last argument.
+
+**On the numbering:** there is no ID table and no registration. The numbers are
+`#define`s and the dispatcher is a `switch`, so a number and its implementation
+cannot drift apart — an unhandled number falls to `default` and returns
+`SYS_ERR_BADNR` without retiring the user. They happen to be contiguous from 0;
+nothing requires that.
+
+**On the error codes:** `SYS_ERR_BADNR` and `SYS_ERR_FAULT` are `(uint32_t)-1`
+and `-2`, so they sit at the top of the value space. A call that could
+legitimately return `0xFFFFFFFE` would be indistinguishable from a failure.
+None currently can, but a new one might, and the fix is an out-parameter rather
+than a cleverer sentinel.
+
+**One thing not to assume:** which core you are on. Nothing is pinned, so
+`xPortGetCoreID()` is valid for this call only, and the same window may service
+its next syscall on the other core.
 
 ---
 
@@ -737,6 +820,20 @@ Predict first — [3.2](#32-the-clic-threshold-write-is-not-immediately-effectiv
 explains what does and does not break, and why the failure mode is a *lost*
 edge-triggered interrupt rather than an immediate crash. Watch the host loop's
 interrupt-in-U-mode counter in the retirement message.
+
+## Exercise 8: Add a Syscall of Your Own
+
+Follow [Adding a Syscall](#adding-a-syscall) and add `SYS_TICKS`, returning
+`xTaskGetTickCount()`. Three edits, no registration, and the user can then
+print elapsed time without a clock of its own.
+
+Then add a deliberately awkward one: `SYS_READ`, which copies a kernel-chosen
+string *into* a buffer the user supplies. That forces you to meet both of the
+rules that matter — validating the caller's pointer and length against its own
+slot before writing a byte, and deciding whether a bad pointer retires the user
+or just returns `SYS_ERR_FAULT`. Get the first one wrong and you have handed
+every user a way to write into any other user's arena, which is precisely the
+hole [Part 5](#part-5--the-limit-of-the-isolation-stated-plainly) is about.
 
 ---
 
