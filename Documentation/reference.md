@@ -10,6 +10,7 @@
 | `main/user_syscall.S` | **U** | The `ecall` stubs and the exit trampoline |
 | `main/umode.h` | Both | The context layout, shared with `umode.S` as byte offsets |
 | `main/syscall.h` | Both | The kernel/user ABI |
+| `main/Kconfig.projbuild` | — | `CONFIG_UMODE_ONCHIP_USER_KB`: how much internal SRAM belongs to U-mode |
 | `probe/` | — | The earlier `mret`-to-U-mode experiment ([README](../probe/README.md)) |
 
 ## Build and Run

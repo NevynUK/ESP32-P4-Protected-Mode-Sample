@@ -16,23 +16,25 @@ KERNEL: pmpcfg 0=809d9b9b 1=8d808b8d 2=80000089 3=9b8b8d8b
 KERNEL: IRAM text ends at 4ff0fa00; PMP entry 4 grants U-mode R+X below it
 KERNEL: user text  4ff01d86 (inside the U-mode execute grant)
 KERNEL: 8 U-mode windows, NONE of them pinned, sharing that one user_main:
-KERNEL:   user0 arena 4ff13690..4ff15690 (8192 bytes, stack and data)
-KERNEL:   user1 arena 4ff15690..4ff17690 (8192 bytes, stack and data)
+KERNEL:   user0 arena 4ff40000..4ff42000 (8192 bytes, stack and data)
+KERNEL:   user1 arena 4ff42000..4ff44000 (8192 bytes, stack and data)
 ...
-KERNEL:   user7 arena 4ff21690..4ff23690 (8192 bytes, stack and data)
+KERNEL:   user7 arena 4ff4e000..4ff50000 (8192 bytes, stack and data)
 KERNEL: the arenas are separate objects and every syscall pointer is
 KERNEL:   checked against the calling user's own bounds, so no user
 KERNEL:   can reach another's memory through the kernel
 KERNEL: hardware stack guard follows each window on to its own arena,
 KERNEL:   read from the assist_debug block of the core it runs on
-KERNEL: slot table at 30100044 (1856 bytes) -- in TCM, which no PMP entry
+KERNEL: slot table at 30100068 (1856 bytes) -- in TCM, which no PMP entry
                                                covers, so U-mode cannot reach it
 KERNEL: PMP entries:
-KERNEL:    4 L TOR   R-X 4ff00000..4ff0fb00
-KERNEL:    5 L TOR   RW- 4ff0fb00..4ffc0000
-...
+KERNEL:    1 - TOR   R-X 4ff00000..4ff11d00
+KERNEL:    3 - TOR   RW- 4ff40000..4ff70000
+KERNEL:    5 - TOR   RW- 48000000..4c000000
 KERNEL: no PMP entry matches these, so U-mode cannot reach them at
 KERNEL:   all while the kernel still can:
+KERNEL:   internal SRAM  4ff11d00..4ff40000 (184 KiB)
+KERNEL:   internal SRAM  4ff70000..4ffc0000 (320 KiB)
 KERNEL:   TCM            30100000..30102000 (8 KiB)
 Kernel 1 (core 0)
 KERNEL: user0: first syscall arrived with mcause=08000008 (ECALL from U-mode) on core 0 -- user_main is running unprivileged

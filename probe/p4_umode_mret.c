@@ -8,8 +8,8 @@
  * READ THIS FIRST -- THE RESULT IS NEGATIVE
  * ===========================================================================
  *
- * This app was written to reproduce a failure seen while bringing up a NuttX
- * BUILD_PROTECTED port on an M5Stack Tab5 (ESP32-P4 rev v1.0).  There, a user
+ * This app was written to reproduce a failure seen while bringing up a
+ * protected-mode port on an M5Stack Tab5 (ESP32-P4 rev v1.0).  There, a user
  * thread's next `ecall` after a resume sometimes fails to vector: the trap IS
  * recognised -- mepc, mcause and mstatus all latch and privilege is raised to M
  * -- but the pc never reaches mtvec.base, so the `ecall` re-executes forever.
@@ -49,7 +49,7 @@
  *   7  U          0x883f0010  masked          1              200000
  *   8  U          0x883f0010  LIVE            1              200000
  *
- * 0x883f0010 is the exact mcause measured at the NuttX failure: interrupt=1,
+ * 0x883f0010 is the exact mcause measured at that failure: interrupt=1,
  * minhv=0, mpp=U, mpie=1, mpil=0x3f (CLIC level 1), exccode 16.  0x083f0010 is
  * the same value with bit 31 cleared.
  *
@@ -87,7 +87,7 @@
  * - NO PMP PROGRAMMING IS NEEDED, which was a surprise.  IDF already grants
  *   U-mode R+X on IRAM text: cpu_region_protect.c sets entry 4 over
  *   [SOC_IRAM_LOW, _iram_text_end) with PMP_TOR | RX, and its RX includes
- *   PMP_L, so the entry applies to U-mode as well as M-mode.  The stub
+ *   the lock bit, so the entry applies to U-mode as well as M-mode.  The stub
  *   therefore just lives in IRAM.
  *
  * - mstatus.MIE DOES NOT MASK INTERRUPTS IN U-MODE.  The first version of this
@@ -129,7 +129,7 @@
 #define MSTATUS_TO_U 0x00000080u /* MPP=U, MPIE=1, MIE=0 */
 #define MSTATUS_TO_M 0x00001880u /* MPP=M, MPIE=1, MIE=0 */
 
-/* The mcause measured on the failing return in the NuttX port:
+/* The mcause measured on the failing return in that port:
  * interrupt=1, minhv=0, mpp=U, mpie=1, mpil=0x3f (CLIC level 1), exccode 16.
  */
 #define MCAUSE_FAIL 0x883f0010u
@@ -150,7 +150,7 @@ uintptr_t g_out[2];
 /* mcause.mpil the handler returns with, i.e. the CLIC level the core is left
  * at between probes.  mret restores mintstatus.mil from it.
  *
- * This matters: in the NuttX port where the wedge occurs, mintstatus reads
+ * This matters: in the port where the wedge occurs, mintstatus reads
  * 0x3f000000 (level 1) persistently, in task context, from boot.  A bare IDF
  * app sits at level 0.  That is one of the few remaining differences between
  * the two environments, so it is made settable rather than assumed irrelevant.
@@ -474,7 +474,7 @@ void app_main(void)
 
     /* [4] and [5]: the same, but with interrupts LIVE in the U-mode window.
      * mstatus.MIE does not apply while the core is in U-mode, so an RTOS cannot
-     * prevent this - NuttX's failing case always has interrupts able to land
+     * prevent this - the failing case always has interrupts able to land
      * between the mret and the next trap.  [4] is the control: interrupts
      * landing on their own, with bit 31 clear.
      */
@@ -483,7 +483,7 @@ void app_main(void)
     run(5, "U-mode, fail, IRQ live", MSTATUS_TO_U, MCAUSE_FAIL, 200000, 0);
 
     /* [6] and [7]: with the core left at CLIC level 1 between probes, matching
-     * the mintstatus = 0x3f000000 that the NuttX port sits at persistently.
+     * the mintstatus = 0x3f000000 that the failing port sits at persistently.
      */
 
     g_ret_mpil = 0x003f0000u;

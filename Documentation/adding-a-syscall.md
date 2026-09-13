@@ -32,10 +32,10 @@ There is no third step for registration. There is no dispatch table.
 ## Three Rules That Are Easy to Get Wrong
 
 **Validate every pointer against the calling slot.**
-`user_range_ok(u, addr, len)` — `u`, not a global arena. PMP entry 5 grants
-U-mode *all* of DRAM ([Part 5](isolation-limits.md#part-5--the-limit-of-the-isolation-stated-plainly)),
-so this check is the only thing keeping the eight users out of each other's
-memory. Use `user_strlen(u, addr, max)` for strings.
+`user_range_ok(u, addr, len)` — `u`, not a global arena. The PMP keeps U-mode
+out of the kernel's memory, but all eight arenas sit in one pool it grants as a
+single range ([Part 5](isolation-limits.md#part-5--the-limit-of-the-isolation-stated-plainly)),
+so this check is the only thing keeping the users out of each other's memory. Use `user_strlen(u, addr, max)` for strings.
 
 **`break` and `return false` are the recoverable/fatal decision.** `break` falls
 through to the tail, which steps `pc` past the `ecall` and writes `ret` into the

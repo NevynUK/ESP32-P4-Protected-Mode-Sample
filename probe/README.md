@@ -14,8 +14,8 @@ original write-up follows verbatim.
 # ESP32-P4: `mret` to U-mode with `mcause.interrupt` — ESP-IDF probe
 
 A standalone ESP-IDF app that isolates the instruction sequence suspected in an
-ESP32-P4 NuttX `BUILD_PROTECTED` bring-up, so it can be exercised without any of
-NuttX in the picture.
+ESP32-P4 protected-mode bring-up elsewhere, so it can be exercised in isolation
+from the system that hit it.
 
 > **Result: it does NOT reproduce the failure — 1.4 million mrets, zero
 > anomalies.** That is the finding. This is a *control*, not a bug report; do
@@ -28,7 +28,7 @@ Target: M5Stack Tab5, ESP32-P4 revision **v1.0**. ESP-IDF **v5.5.4**.
 
 ## What was suspected
 
-In the NuttX port, a user thread resumed by the trap epilogue makes its next
+In the system that hit it, a user thread resumed by the trap epilogue makes its next
 `ecall` fail to vector: the trap is recognised — `mepc`, `mcause` and `mstatus`
 all latch and privilege is raised to M — but the pc never reaches `mtvec.base`,
 so the `ecall` re-executes forever. Clearing `mcause.interrupt` (bit 31) on
@@ -45,10 +45,17 @@ FreeRTOS never leaves M-mode, so every `mret` in IDF's own `vectors.S` is M→M.
 three CSR writes a trap epilogue does (`mepc`, `mcause`, `mstatus`) and `mret`s
 to a stub of `ecall`s, then reports the `mcause` the resulting trap produced.
 
-No PMP programming is needed: IDF already grants U-mode R+X on IRAM text.
-`cpu_region_protect.c` sets entry 4 over `[SOC_IRAM_LOW, _iram_text_end)` with
-`PMP_TOR | RX`, and its `RX` includes `PMP_L`, so the entry applies to U-mode as
-well as M-mode. The stub therefore lives in IRAM and is executable from U-mode.
+No PMP programming was needed when this was written: ESP-IDF's default
+configuration already granted U-mode R+X on IRAM text, via a locked entry over
+`[SOC_IRAM_LOW, _iram_text_end)`. A locked entry applies to U-mode as well as
+M-mode, so a stub in IRAM was executable from U-mode for free.
+
+> **That is no longer true in this repository.** The parent project now sets
+> `CONFIG_BOOTLOADER_REGION_PROTECTION_ENABLE=n` and programs the PMP itself,
+> which leaves every entry OFF at reset and grants U-mode nothing until the
+> kernel says so. Rebuilding this probe against the current `sdkconfig` would
+> fault on the first instruction fetch in U-mode. It needs its own execute
+> grant, or a build with region protection left on.
 
 | # | privilege | `mcause` | interrupts in the window | resting CLIC level |
 |---|---|---|---|---|
@@ -97,18 +104,18 @@ rather than 0 — in every combination above.
 
 Also ruled out **since this app was written**: the separate user image and its
 PMP boundary, which was the leading candidate for a while. Tested back in the
-NuttX harness by mret-ing to stubs in kernel SRAM, kernel flash and the user
+original harness by mret-ing to stubs in kernel SRAM, kernel flash and the user
 image with matched iteration counts — all clean (ESP32P4-Kernel.md §36.20).
 Note the trap there: the first comparison used 500 iterations for the kernel
 stubs against **one** for the user stub, which looked like a positive result
 until the counts were matched.
 
-Still different between this app and the NuttX case, and therefore still
+Still different between this app and the failing case, and therefore still
 candidates:
 
-- NuttX's own `mtvec`, trap frames and `mscratch`/kernel-stack machinery
+- that system's own `mtvec`, trap frames and `mscratch`/kernel-stack machinery
   interleave with the probe; here the private vector is the only user;
-- the failing NuttX stage runs after thousands of syscalls, context switches and
+- the failing stage there runs after thousands of syscalls, context switches and
   pthread create/exit cycles.
 
 The current reading (ESP32P4-Kernel.md §36.20.3) is that the trigger needs the

@@ -56,7 +56,7 @@ diagnosed and fixed in this tree, each teaching something no datasheet says.
 | 4 | [Adding a Syscall](Documentation/adding-a-syscall.md) | Three edits, the rules that are easy to get wrong, and the limits — argument count, return width, numbering |
 | 5 | [Hard-Won Lessons](Documentation/hard-won-lessons.md) | The six things that do not work the obvious way |
 | 6 | [Exercises](Documentation/exercises.md) | Break it deliberately; most have captured output to check against |
-| 7 | [The Limit of the Isolation](Documentation/isolation-limits.md) | What this does **not** protect, stated plainly, and how to read the PMP |
+| 7 | [The Limit of the Isolation](Documentation/isolation-limits.md) | What the hardware enforces, what is still software, and how to read the PMP |
 | 8 | [Reference](Documentation/reference.md) | Files, build, gotchas, further reading, glossary |
 
 ### The Six Lessons
@@ -83,6 +83,7 @@ diagnosed and fixed in this tree, each teaching something no datasheet says.
 | 7 | [Leave interrupts unmasked](Documentation/exercises.md#exercise-7-leave-interrupts-unmasked) | Why the window masks, and what is lost if it does not |
 | 8 | [Add a syscall of your own](Documentation/exercises.md#exercise-8-add-a-syscall-of-your-own) | The whole interface, including the pointer rules |
 | 9 | [Scribble on the kernel's slot table](Documentation/exercises.md#exercise-9-scribble-on-the-kernels-slot-table) | The one boundary the PMP enforces, not the kernel |
+| 10 | [Reach into the kernel's memory](Documentation/exercises.md#exercise-10-reach-into-the-kernels-memory) | The kernel/user split, and what it still does not cover |
 
 ## What You Will Learn
 
@@ -96,6 +97,9 @@ diagnosed and fixed in this tree, each teaching something no datasheet says.
   between cores, and what has to be duplicated per core.
 - How to read `mcause`, `mtval` and `mepc` to work out what a faulting program
   did.
+- How to take the PMP over from ESP-IDF and describe a kernel/user memory
+  split the hardware enforces — and why IDF's own configuration makes that
+  impossible until you stop it running.
 - Why a memory-protection story can be *almost* right and still be worth
   nothing — and how to tell the difference.
 

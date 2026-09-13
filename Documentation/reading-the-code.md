@@ -44,10 +44,10 @@ Four constraints, all consequences of running unprivileged:
   it; the same code in flash would fault on the instruction fetch. The boot
   report prints whether `user_main` actually landed inside the grant.
 
-- **Data in DRAM.** Entry 5 grants U-mode read+write over the DRAM above.
-  String constants are `DRAM_ATTR` rather than left in flash rodata — flash
-  rodata happens to be U-readable in this configuration, but depending on that
-  would tie the app to a PMP entry it has no reason to need.
+- **Data in its own arena.** U-mode can no longer reach the kernel's internal
+  memory at all, so the user's string constants cannot live there. The kernel
+  copies them into the bottom of each arena at start-up and passes a pointer in
+  `a1`, which means a user touches nothing but memory it owns.
 
 - **No writable statics**, as above, because eight instances share the code.
 

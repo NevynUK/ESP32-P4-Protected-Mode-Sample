@@ -1,193 +1,178 @@
 # Part 5 — The Limit of the Isolation, Stated Plainly
 
-**Read this before citing the project as a protected-mode example.**
+**Read this before citing the project as a protected-mode example**, in either
+direction. The kernel/user boundary is now enforced by hardware. The
+user/user boundary is not.
+
+This document used to say the memory boundary was software throughout, and
+explained at length why it could not be otherwise. That is no longer true, and
+the reason it changed is worth more than the conclusion: nothing about the
+silicon was in the way. What was in the way was ESP-IDF's default PMP
+configuration, and it could simply be replaced.
+
+## What the Hardware Enforces
 
 The **privilege** boundary is real. U-mode code that executes a `csr`
 instruction, an `mret`, or anything else reserved to M-mode takes an
 illegal-instruction trap and lands in the kernel's fault handler
-([Exercise 1](exercises.md#exercise-1-execute-a-privileged-instruction) proves it). `ecall`
-is the only way across.
+([Exercise 1](exercises.md#exercise-1-execute-a-privileged-instruction) proves
+it). `ecall` is the only way across.
 
-The **memory** boundary is not what a production protected build would have, and
-that is ESP-IDF's doing rather than a shortcut taken here.
-`esp_cpu_configure_region_protection()` runs very early, before any application
-code runs, and sets **the lock bit on every entry it programs** — its `NONE`,
-`R`, `RW`, `RX` and `RWX` constants all carry `PMP_L`. PMP lock bits cannot be
-cleared without Smepmp, which the ESP32-P4 does not implement, so those entries
-are final for the rest of the boot. A locked entry applies to U-mode *and* to
-M-mode.
+The **memory** boundary is now real too. U-mode is granted three ranges and
+nothing else:
 
-Two of them are what this project rests on:
-
-| Entry | Range | Permissions |
+| Range | Permissions | What It Is |
 |---|---|---|
-| 4 | `[SOC_IRAM_LOW, _iram_text_end)` | R+X, locked |
-| 5 | `[_iram_text_end, SOC_DRAM_HIGH)` | R+W, locked |
+| `[SOC_IRAM_LOW, _iram_text_end)` | R+X | The code U-mode executes |
+| The user pool | R+W | `CONFIG_UMODE_ONCHIP_USER_KB` of internal SRAM; the arenas are carved from it |
+| `[SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH)` | R+W | All 32 MB of PSRAM |
 
-Those two grants are exactly what let `user_main` run at all — but entry 5 also
-means U-mode can read and write **all** of kernel DRAM, and both arenas, not
-just its own. So:
-
-- the kernel validates every pointer arriving from a syscall against **the
-  calling slot's** arena (`user_range_ok()`), which is good practice regardless,
-  but here it is doing work the hardware would otherwise do;
-- the isolation between the eight users is entirely software, for the same
-  reason — nothing in the hardware separates one arena from another;
-- **with one exception: the slot table.** It lives in TCM, which no PMP entry
-  covers at all, so U-mode cannot reach it however it tries — see
-  [What U-mode Cannot Reach](#what-u-mode-cannot-reach) below;
-- the stack guard does **not** close the gap and should not be mistaken for it.
-  It watches `sp`, not accesses. A user that leaves `sp` alone and writes through
-  a wild pointer is caught by neither, which is what `user_range_ok()` is for.
-
-### Reading the PMP Configuration
-
-The boot report decodes all sixteen entries on the board rather than describing
-them here, so you can check the above rather than take it on trust:
+Everything else matches no PMP entry at all, and **PMP is default-deny for
+U-mode and default-allow for M-mode**, so the kernel reaches it freely and
+U-mode cannot touch it however it tries. The boot report subtracts one from the
+other rather than asserting anything:
 
 ```
 KERNEL: PMP entries:
-KERNEL:    0 L NAPOT RW- 20000000..30000000
-KERNEL:    3 L OFF   --- matches nothing
-KERNEL:    4 L TOR   R-X 4ff00000..4ff0fb00
-KERNEL:    5 L TOR   RW- 4ff0fb00..4ffc0000
-KERNEL:    9 - OFF   --- matches nothing
-KERNEL:   13 L TOR   --- matches nothing
+KERNEL:    1 - TOR   R-X 4ff00000..4ff11d00
+KERNEL:    3 - TOR   RW- 4ff40000..4ff70000
+KERNEL:    5 - TOR   RW- 48000000..4c000000
+KERNEL: no PMP entry matches these, so U-mode cannot reach them at
+KERNEL:   all while the kernel still can:
+KERNEL:   internal SRAM  4ff11d00..4ff40000 (184 KiB)
+KERNEL:   internal SRAM  4ff70000..4ffc0000 (320 KiB)
+KERNEL:   PSRAM window   -- fully covered, U-mode reaches all of it
+KERNEL:   flash window   40000000..44000000 (65536 KiB)
+KERNEL:   TCM            30100000..30102000 (8 KiB)
+KERNEL:   RTC / LP RAM   50108000..50110000 (32 KiB)
+KERNEL:   peripherals    50000000..50100000 (1024 KiB)
 ```
 
-`L` is the lock bit, then the matching mode, then the permissions. Two entries
-in that list are doing nothing at all: 9 and 10 are unlocked and unprogrammed,
-and **13 is a TOR entry whose base and limit are the same address**, so it
-matches an empty range. One of the sixteen is wasted.
+**504 KiB of internal SRAM is off-limits to U-mode** — the kernel's heap, its
+task stacks, its data — along with the slot table in TCM, the peripherals, RTC
+RAM and the flash window.
+[Exercise 10](exercises.md#exercise-10-reach-into-the-kernels-memory)
+demonstrates the fault.
+
+## How the Kernel Takes the PMP Over
+
+`CONFIG_BOOTLOADER_REGION_PROTECTION_ENABLE=n`, and then `pmp_apply()` in
+`kernel_main.c` programs all sixteen entries itself.
+
+That option is the whole trick. ESP-IDF's
+`esp_cpu_configure_region_protection()` runs very early and **locks** every
+entry it programs — and one of them grants U-mode read and write over the whole
+of internal DRAM. A locked entry ignores writes to both its configuration and
+its address, and PMP lock bits cannot be cleared without **Smepmp**, which the
+ESP32-P4 does not implement. So there was no way to build a split on top of it.
+Not because of the hardware — because of a default.
+
+With the option off, IDF never calls that function and the PMP is left in its
+**reset state**, which is a better starting point than anything that could have
+been negotiated: every entry OFF means U-mode can touch *nothing*, and the
+kernel hands back only what is needed.
+
+**Nothing the kernel programs is locked, and that is the mechanism rather than
+an oversight.** A PMP entry always applies to U-mode; the lock bit only decides
+whether it *also* applies to M-mode. Unlocked entries therefore constrain the
+user while leaving the kernel's own access untouched — exactly the asymmetry a
+kernel/user split needs, and why the kernel can still reach memory the user
+cannot.
+
+The PMP is per-hart, so `pmp_apply()` runs on both cores;
+`esp_ipc_call_blocking()` carries it to the second one. An unpinned host task
+runs wherever the scheduler put it, so a grant made on one core only would be a
+trap waiting to spring.
+
+## Reading the PMP Configuration
+
+The boot report decodes all sixteen entries on the board, so you can check the
+above rather than take it on trust. `L` is the lock bit — all dashes now — then
+the matching mode, then the permissions.
+
+A **TOR** entry spans from the *previous* entry's address to its own, which is
+why each range costs two entries and why the odd-numbered ones carry the
+permissions. Entry 0 holds `SOC_IRAM_LOW` with its mode OFF, granting nothing
+by itself, purely to give entry 1 a lower bound.
 
 The raw `pmpcfg` words are printed too. Each packs four entries, one byte each,
 entry 0 in the low byte:
 
 | Bit | Field | Values |
 |---|---|---|
-| 7 | `L` | Lock. Once set, the entry cannot be changed, and it applies to M-mode too |
+| 7 | `L` | Lock. Once set the entry cannot be changed, and it binds M-mode too |
 | 6:5 | — | Reserved, zero |
 | 4:3 | `A` | Address matching: `0`=OFF, `1`=TOR, `2`=NA4, `3`=NAPOT |
 | 2 | `X` | Execute |
 | 1 | `W` | Write |
 | 0 | `R` | Read |
 
-**`TOR` means "top of range", and it takes its base from the *previous* entry's
-`pmpaddr`.** That is why entry 3 exists at all: it is set to `SOC_IRAM_LOW` with
-`A=OFF`, granting nothing, purely to supply entry 4's lower bound. Entry 4's
-range is `[pmpaddr3, pmpaddr4)` and entry 5's is `[pmpaddr4, pmpaddr5)` — which
-is how the two rows in the table above get their boundaries.
+## What U-mode Cannot Reach
 
-Decoding the words above gives this board's actual configuration:
+Everything outside the three granted ranges — and the list in the boot report
+is generated by subtracting them from the memory map, not written by hand, so
+it stays true as the configuration changes.
 
-| Entry | Byte | L | A | Perms |  |
-|---|---|---|---|---|---|
-| 0 | `9b` | 1 | NAPOT | RW |  |
-| 1 | `9b` | 1 | NAPOT | RW |  |
-| 2 | `9d` | 1 | NAPOT | RX |  |
-| 3 | `80` | 1 | OFF | — | Base for entry 4 |
-| 4 | `8d` | 1 | TOR | RX | **The U-mode execute grant** |
-| 5 | `8b` | 1 | TOR | RW | **The U-mode data grant — all of DRAM** |
-| 6 | `80` | 1 | OFF | — | Base for entry 7 |
-| 7 | `8d` | 1 | TOR | RX |  |
-| 8 | `89` | 1 | TOR | R |  |
-| 9 | `00` | **0** | OFF | — | Never programmed |
-| 10 | `00` | **0** | OFF | — | Never programmed |
-| 11 | `80` | 1 | OFF | — | Base for entry 12 |
-| 12 | `8b` | 1 | TOR | RW |  |
-| 13 | `8d` | 1 | TOR | RX |  |
-| 14 | `8b` | 1 | TOR | RW |  |
-| 15 | `9b` | 1 | NAPOT | RW |  |
+Two entries in it are worth singling out.
 
-So "all sixteen locked" would be too strong: **entries 9 and 10 are unlocked and
-unprogrammed** on this configuration. IDF only sets them in its external-RAM
-branch, and this build takes the other one — visible in entry 8 being `R` rather
-than `RW`. IDF's own comment notes the spare entries "can be used to provide
-more granular access".
-
-**They do not help here, and the reason is worth understanding.** PMP entries are
-statically prioritised: **the lowest-numbered entry that matches any byte of an
-access decides it**, and no higher-numbered entry is consulted. Entry 5 already
-matches every DRAM address, and 5 < 9, so a stricter rule installed at entry 9
-or 10 would be shadowed and never evaluated. Spare high entries can *grant*
-access to ranges that no lower entry matches — which is what IDF means — but they
-cannot *narrow* a grant a lower entry has already made.
-
-That is the structural reason this gap cannot be closed by adding entries. It can
-only be closed by changing entries 4 and 5, and those are locked.
-
-`components/esp_hw_support/port/esp32p4/cpu_region_protect.c` in your IDF
-checkout is the file to read alongside this table — it is what programs every
-entry above.
-
-### What U-mode Cannot Reach
-
-Subtracting the covered ranges from the memory map gives the other half of the
-picture, and the boot report does that too. **PMP is default-deny for U-mode and
-default-allow for M-mode**, so an address no entry matches is unreachable from
-U-mode and perfectly reachable from the kernel:
+**TCM holds the slot table.** 8 KiB of internal memory tightly coupled to the
+CPU — wired into the pipeline rather than reached over the system bus — and
+shared between both cores rather than a per-core alias like the CLIC, which
+matters because an unpinned host task has to see the same slot wherever it
+runs. `g_slots` holds every window's **saved context**, so without this, one
+user scribbling at random could corrupt another window's saved registers.
 
 ```
-KERNEL: no PMP entry matches these, so U-mode cannot reach them at
-KERNEL:   all while the kernel still can:
-KERNEL:   internal SRAM  -- fully covered, U-mode reaches all of it
-KERNEL:   PSRAM window   48000000..4c000000 (65536 KiB)
-KERNEL:   flash window   40030000..44000000 (65344 KiB)
-KERNEL:   TCM            30100000..30102000 (8 KiB)
-KERNEL:   RTC / LP RAM   -- fully covered, U-mode reaches all of it
-KERNEL:   peripherals    -- fully covered, U-mode reaches all of it
-```
-
-Those ranges are the only memory on this board that U-mode cannot touch **by
-hardware**, and they cost nothing: no unlocking, no reconfiguration, no spare
-PMP entry. They are simply what IDF never described.
-
-**TCM is the usable one.** 8 KiB of internal memory, tightly coupled to the
-CPU — wired into the pipeline rather than reached through the system bus, so
-access is fast and deterministic — and shared between both cores rather than a
-per-core alias like the CLIC. That last point matters here: an unpinned host
-task has to see the same slot wherever it runs.
-
-So the slot table lives there:
-
-```
-KERNEL: slot table at 30100044 (1856 bytes) -- in TCM, which no PMP entry
+KERNEL: slot table at 30100068 (1856 bytes) -- in TCM, which no PMP entry
                                                covers, so U-mode cannot reach it
 ```
 
-`g_slots` holds every window's **saved context**. Before the move, one user
-scribbling at random could corrupt another window's saved registers — the
-weakest link in an isolation story that is otherwise entirely software. Now it
-cannot, and [Exercise 9](exercises.md#exercise-9-scribble-on-the-kernels-slot-table)
-demonstrates the fault.
+**The peripherals** were reachable from U-mode under IDF's configuration and
+are not now. Nothing noticed, because the user application never had any
+business there — but it is a reminder that the old default was permissive in
+ways this project never asked for.
 
-The flash window is not RAM, so it is no use here. **PSRAM is a different
-matter, and more interesting than it first looks.** It is enabled — 32 MB of it
-joins the heap at boot — and yet it stays in this list, because IDF does *not*
-describe the external RAM window to the PMP on this configuration. So PSRAM is
-currently reachable by the kernel and not by U-mode, exactly like TCM, only
-four thousand times larger.
+## What Is Still Software
 
-That also makes entries 9 and 10 useful after all. They are shadowed for
-internal DRAM, because entry 5 matches those addresses first and the lowest
-match wins — but **no entry at all matches a PSRAM address**, so entry 9 is the
-first match there. Two free, unlocked entries and a 32 MB region nobody has
-claimed is the one place the PMP can still be steered without touching IDF's
-locked configuration.
+**The users are not isolated from each other.** All eight arenas are carved out
+of the same pool, and the PMP grants that pool read and write as a single
+range. It cannot distinguish one arena from another, so:
 
-Keep it in proportion. This is 1856 bytes of hardware-enforced protection in a
-system whose arenas — the thing users actually write to — are still shared
-DRAM, separated only by `user_range_ok()`. It closes one specific hole, not the
-gap.
+- a user can read and write another user's arena directly, and nothing stops
+  it — [Exercise 4](exercises.md#exercise-4-reach-into-the-other-users-arena)
+  still succeeds;
+- `user_range_ok()` checks every syscall pointer against **the calling slot's**
+  arena, which stops the kernel being *talked into* crossing that line on a
+  user's behalf, but does nothing about a user crossing it directly;
+- the stack guard does **not** close it either, and should not be mistaken for
+  it. It watches `sp`, not accesses. A user that leaves `sp` alone and writes
+  through a wild pointer is caught by neither.
 
-### Closing the Gap
+## Closing What Remains
 
-Closing it means stopping the entries being locked in the first place. The
-NuttX `BUILD_PROTECTED` port for this board does exactly that: it drops IDF's
-`cpu_region_protect.c` from the build and recompiles the same source with `PMP_L`
-defined to zero (`CONFIG_ESPRESSIF_KERNEL_OWNS_PMP`), then re-describes the
-regions for a kernel/user split. The same trick would work here — define
-`esp_cpu_configure_region_protection()` in this component so the linker prefers
-it over IDF's, and reprogram the entries in `kernel_main()`. **That is not done
-in this tree**, and it is the single biggest thing a reader should understand
-before drawing conclusions about what this demonstrates.
+The user/user gap is a scheduling problem rather than a hardware limitation.
+The PMP can describe one user's arena precisely; it just cannot describe eight
+at once. Reprogramming a single entry pair in `umode_enter()` — pointing it at
+the arena of the window about to run — would give each user a boundary the
+hardware enforces, at the cost of two CSR writes per window.
+
+That is a design rather than a hypothetical: `umode_pmp_program()` already
+writes the entries, the window already saves and restores per-hart state around
+every entry and exit, and the slot already knows its own bounds.
+
+Three other things are still open.
+
+**The IRAM text grant is whole-region.** U-mode gets read and execute over all
+of `[SOC_IRAM_LOW, _iram_text_end)`, not just the user's own functions, so a
+user can execute kernel IRAM code — including the trap vector. Narrowing it
+needs the user's code in a linker section of its own.
+
+**IDF's PMA entries are no longer programmed.** They came from the same
+function, and they cover the *unmapped gaps* in the address space, existing to
+fault on accesses to nothing. What is lost is a debugging aid rather than any
+cacheability or correctness property of real memory — but it is a real loss,
+and it is the price of that option being all-or-nothing.
+
+**The split is not even.** 192 KiB to the user against 504 KiB kept by the
+kernel, because the pool is a static array and ESP-IDF needs room to work in.
+`CONFIG_UMODE_ONCHIP_USER_KB` moves the line directly.

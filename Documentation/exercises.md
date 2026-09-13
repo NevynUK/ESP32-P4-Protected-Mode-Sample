@@ -105,8 +105,8 @@ Take the address the boot report prints for the *other* user's arena and pass it
 to `SYS_PUTS`. Expect the same rejection as Exercise 3.
 
 This is the exercise that shows why `user_range_ok()` takes the slot rather than
-checking against a single global arena. PMP entry 5 grants U-mode **all** of
-DRAM (see [Part 5](isolation-limits.md#part-5--the-limit-of-the-isolation-stated-plainly)), so both
+checking against a single global arena. All eight arenas are carved out of one
+pool that the PMP grants as a single range (see [Part 5](isolation-limits.md#part-5--the-limit-of-the-isolation-stated-plainly)), so both
 arenas are equally reachable from either user; the only thing separating them is
 this check. To see the check itself rather than a user's view of it, call
 `user_range_ok(&g_slots[0], (uint32_t)(uintptr_t) g_slots[1].arena, 1)` in
@@ -199,3 +199,37 @@ whole of [the isolation limits](isolation-limits.md#what-u-mode-cannot-reach).
 
 Then try the same store against one of the other users' arenas, whose addresses
 the boot report also prints. It succeeds silently. That is the gap.
+
+## Exercise 10: Reach into the Kernel's Memory
+
+*Is the kernel/user boundary hardware or bookkeeping?* The boot report lists
+the ranges no PMP entry covers. Pick an address inside one of the internal SRAM
+ranges and store to it from `user_main`:
+
+```c
+if (id == 0 && tick == 18)
+{
+    *(volatile uint32_t *) 0x4ff80000u = 0xdeadbeefu;   /* the kernel's half */
+}
+```
+
+**Captured:**
+
+```
+KERNEL: user0: user fault: store access fault
+KERNEL:   mcause=08000007 mtval=4ff80000 pc=4ff020d4 sp=4ff41fb0
+KERNEL: user0: user context retired after 360028 syscalls
+User 1.3 on core 0
+User 2.3 on core 1
+```
+
+The detail that makes it conclusive is **`sp=4ff41fb0`**. That is inside the
+user pool, so the user was running happily in its own on-chip memory at the
+instant it was refused the kernel's — a live process hitting exactly one wall,
+not a broken one failing at everything. The other seven windows carried on.
+
+Now change the address to another user's arena, which the boot report also
+prints. **It succeeds silently.** Both stores are "a user touching memory that
+is not its own"; one is refused by the PMP and the other is not, and the
+difference is [what the hardware can and cannot express](isolation-limits.md#what-is-still-software)
+with sixteen entries.

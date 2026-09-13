@@ -99,33 +99,35 @@
  * trap and lands in the handler below.  The syscall interface is the only way
  * across.
  *
- * The MEMORY boundary is not what a production protected build would have, and
- * that is ESP-IDF's doing rather than a shortcut taken here.  IDF's
- * esp_cpu_configure_region_protection() programs all sixteen PMP entries with
- * the lock bit set, very early, before any application code runs.  PMP lock
- * bits cannot be cleared without Smepmp, which the ESP32-P4 does not implement.
- * The entries are therefore final for the rest of the boot, and two of them
- * matter here:
+ * The MEMORY boundary is real for the kernel and not for the users, and it is
+ * worth being precise about which is which.
  *
- *   entry 4  [SOC_IRAM_LOW, _iram_text_end)   R+X, locked
- *   entry 5  [_iram_text_end, SOC_DRAM_HIGH)  R+W, locked
+ * This kernel programs the PMP itself -- see pmp_apply() below -- rather than
+ * living with the one ESP-IDF installs.  IDF's
+ * esp_cpu_configure_region_protection() LOCKS every entry it programs, and one
+ * of them grants U-mode read and write over the whole of internal DRAM; a
+ * locked entry ignores writes to its configuration and its address, and PMP
+ * lock bits cannot be cleared without Smepmp, which the ESP32-P4 does not
+ * implement.  CONFIG_BOOTLOADER_REGION_PROTECTION_ENABLE=n stops that function
+ * ever running, which leaves the PMP in its reset state: every entry OFF,
+ * which denies U-mode everything and grants M-mode everything, and the kernel
+ * hands back only what a user needs.
  *
- * A locked entry applies to U-mode as well as M-mode, so those two grants are
- * exactly what let user_main() run at all -- but entry 5 also means U-mode can
- * read and write all of kernel DRAM, not just its own arena.  The kernel
- * therefore validates every pointer that arrives from a syscall against the
- * arena (user_range_ok() below) rather than trusting hardware to have done it,
- * which is good practice regardless, but it is a kernel-side check, not a
- * hardware one.
+ * U-mode therefore cannot reach the kernel's heap, its task stacks, its data,
+ * or the slot table in TCM.  That is hardware, not a check anyone has to
+ * remember to make, and the boot report prints the ranges it cannot touch.
  *
- * Closing that gap means stopping the entries being locked in the first place,
- * by rebuilding IDF's cpu_region_protect.c with PMP_L defined to zero and
- * re-describing the regions for a kernel/user split.  See README.md.
+ * What is NOT enforced is one user against another.  All the arenas are carved
+ * out of one pool and the PMP grants that pool as a single range, so a user can
+ * read and write another user's arena directly and nothing stops it.
+ * user_range_ok() below checks every syscall pointer against the CALLING
+ * slot's arena, which stops the kernel being talked into crossing that line on
+ * a user's behalf -- but it does nothing about a user crossing it itself.
  *
- * The stack guard described above does not close it either, and should not be
- * mistaken for it: it watches sp, not accesses.  A user that leaves sp alone
- * and writes through a wild pointer is caught by neither, which is what
- * user_range_ok() is for.
+ * The stack guard does not close that either, and should not be mistaken for
+ * it: it watches sp, not accesses.  A user that leaves sp alone and writes
+ * through a wild pointer is caught by neither, which is what user_range_ok()
+ * is for.
  */
 
 /****************************************************************************
@@ -1230,8 +1232,8 @@ static void boot_report(void)
 
     pmp_report();
     kprintf(
-        "KERNEL: IRAM text ends at %08lx; PMP entry 4 grants U-mode R+X "
-        "below it\n",
+        "KERNEL: IRAM text ends at %08lx; the U-mode execute grant covers "
+        "everything below it\n",
         (unsigned long) iram_end);
     kprintf("KERNEL: user text  %08lx (%s)\n", (unsigned long) user_pc, (user_pc >= SOC_IRAM_LOW && user_pc < iram_end) ? "inside the U-mode execute grant" : "OUTSIDE the grant -- U-mode will fault on the fetch");
     kprintf("KERNEL: %d U-mode windows, NONE of them pinned, sharing that one user_main:\n", USER_SLOTS);
