@@ -5,7 +5,7 @@ CONFIG_IDF_TARGET="esp32p4"
 # range [v3.1 - v3.99]").  The <3.0 revisions are gated behind an explicit
 # opt-in because IDF cannot support both families in one binary.
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_ESP32P4_REV_MIN_1=y
 
 # Console on UART0 (GPIO37/38 on the P4), which on this board reaches the
 # external USB bridge -- /dev/cu.usbserial-*.  That leaves the USB-Serial/JTAG
@@ -19,30 +19,31 @@ CONFIG_ESP_INT_WDT=n
 CONFIG_ESP_TASK_WDT_INIT=n
 CONFIG_BOOTLOADER_WDT_ENABLE=n
 
-# External PSRAM: NOT ENABLED, and not for want of trying.
+# Flash is 16 MB on the Tab5.  This was set to 2 MB, which the ROM noticed on
+# every boot ("Detected size(16384k) larger than the size in the binary image
+# header(2048k)") and which this project ignored for a long time.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# External PSRAM: 32 MB, HEX (16-line) at 200 MHz.
 #
-# The Tab5 has PSRAM and this project would like to use it, but CONFIG_SPIRAM=y
-# does not boot on this board.  The second-stage bootloader panics immediately
-# after "Multicore bootloader" with a Store/AMO access fault on 0x5008e380 --
-# a register of SPIMEM2, the controller that drives PSRAM.  Identical fault at
-# 200 MHz and at 80 MHz, and at the same address, so it is not a timing or
-# speed problem: the access to the controller itself does not complete.
+# SPIRAM_SPEED_200M is gated behind IDF_EXPERIMENTAL_FEATURES and the two have
+# to be set together -- enabling CONFIG_SPIRAM on its own does not boot.
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# This project programs the PMP itself -- see pmp_apply() in kernel_main.c.
 #
-# This is pre-rev3 silicon (v1.0, see CONFIG_ESP32P4_SELECTS_REV_LESS_V3 above)
-# and IDF v5.5.4's P4 PSRAM support is written for rev3 -- its one P4-specific
-# workaround is compiled out precisely when that option is set, and the build
-# uses the hw_ver1 register definitions rather than hw_ver3.  Treat PSRAM as
-# unavailable here until either the silicon or IDF's support for it changes.
+# With region protection on, esp_cpu_configure_region_protection() runs first
+# and LOCKS every entry it sets, one of which grants U-mode read+write over all
+# of internal DRAM.  Locked entries cannot be changed, so there is no way to
+# build a kernel/user split on top of it.  Off, the PMP is left in its reset
+# state -- every entry OFF, which denies U-mode everything and grants M-mode
+# everything -- and the kernel hands back only what the user needs.
 #
-# The consequence is visible in the boot report: with SPIRAM off, IDF never
-# programs PMP entries for the external RAM window, so the whole 64 MiB of it
-# has no matching entry and U-mode cannot reach it at all.
-#
-# AND IF YOU DO TRY IT: the board does not recover by itself.  After the failed
-# PSRAM bring-up the SAME bootloader fault kept happening with SPIRAM off again,
-# from a clean rebuild, with an sdkconfig byte-identical to the one that had
-# worked minutes earlier -- and in a bootloader containing none of this
-# project's code.  Reflashing does not help and neither does a reset over RTS:
-# PSRAM VDD comes from the MPLL LDO domain (SOC_PSRAM_VDD_POWER_MPLL) and the
-# half-configured state survives an EN reset.  Pull the USB lead out and put it
-# back in.  The board comes straight back.
+# The cost is that IDF's PMA entries are not programmed either.  Those cover
+# the UNMAPPED gaps in the address space and exist to fault on accesses to
+# nothing, so what is lost is a debugging aid rather than any cacheability or
+# correctness property of real memory.
+CONFIG_BOOTLOADER_REGION_PROTECTION_ENABLE=n

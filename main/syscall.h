@@ -73,7 +73,23 @@ void u_exit_stub(void);
  * lives on the user stack its own context points at.
  */
 
-void user_main(uint32_t id);
+/* The strings the user application prints.
+ *
+ * These used to be DRAM_ATTR constants in internal memory, which was the last
+ * thing U-mode needed to read outside its own arena.  The kernel now copies
+ * them into the bottom of each arena and passes a pointer in a1, so a user
+ * touches nothing but its own memory and the on-chip split can deny it all of
+ * internal DRAM.
+ */
+
+typedef struct
+{
+    char user_prefix[8];       /* "User "     */
+    char core_infix[12];       /* " on core " */
+    char syscall_prefix[12];   /* "syscall "  */
+} user_rodata_t;
+
+void user_main(uint32_t id, const user_rodata_t *ro);
 
 #endif /* __ASSEMBLER__ */
 #endif /* __SYSCALL_H */

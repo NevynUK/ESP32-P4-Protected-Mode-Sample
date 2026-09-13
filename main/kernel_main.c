@@ -137,6 +137,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -144,6 +145,8 @@
 
 #include "esp_attr.h"
 #include "esp_rom_sys.h"
+#include "esp_heap_caps.h"
+#include "esp_ipc.h"
 #include "soc/assist_debug_reg.h"
 #include "soc/clic_reg.h"
 #include "soc/interrupts.h"
@@ -219,7 +222,43 @@
  * object with its own bounds, which is what user_range_ok() checks against.
  */
 
-static uint8_t g_user_arenas[USER_SLOTS][USER_ARENA_SIZE] __attribute__((aligned(16)));
+/* The user side of the on-chip split.
+ *
+ * CONFIG_UMODE_ONCHIP_USER_KB of internal SRAM that belongs to U-mode; the
+ * kernel keeps every other byte.  The PMP grants read and write over exactly
+ * this range, so the kernel's heap, stacks and data are unreachable from
+ * U-mode by hardware rather than by a check the kernel remembers to make.
+ *
+ * Aligned to the PMP's region granularity because the grant's bounds are this
+ * array's bounds, and the hardware ignores address bits below that.
+ *
+ * The arenas are carved out of it by a bump allocator -- they are handed out
+ * once at start-up and never freed, so anything cleverer would be decoration.
+ */
+
+#define USER_POOL_SIZE (CONFIG_UMODE_ONCHIP_USER_KB * 1024)
+
+static uint8_t g_user_pool[USER_POOL_SIZE]
+    __attribute__((aligned(SOC_CPU_PMP_REGION_GRANULARITY)));
+
+static size_t g_user_pool_used;
+
+_Static_assert(USER_POOL_SIZE >= USER_SLOTS * USER_ARENA_SIZE,
+               "CONFIG_UMODE_ONCHIP_USER_KB is too small to hold the arenas");
+
+static void *user_pool_alloc(size_t len)
+{
+    void *p;
+
+    len = (len + 15u) & ~(size_t) 15u;
+
+    configASSERT(g_user_pool_used + len <= sizeof(g_user_pool));
+
+    p = &g_user_pool[g_user_pool_used];
+    g_user_pool_used += len;
+
+    return p;
+}
 
 /* Names live here rather than as string literals because the slots are built
  * in a loop now; "user0".."user7" at eight slots.
@@ -720,6 +759,7 @@ static void report_stack_fault(const user_slot_t *u)
 static void user_ctx_init(user_slot_t *u)
 {
     umode_ctx_t *ctx = &u->ctx;
+    user_rodata_t *ro;
     uintptr_t stack_top;
     int i;
 
@@ -731,9 +771,22 @@ static void user_ctx_init(user_slot_t *u)
     stack_top = (uintptr_t) u->arena + u->arena_size;
     stack_top &= ~(uintptr_t) 15;
 
+    /* The user's strings go at the bottom of its arena and a1 points at them.
+     * They used to be constants in internal DRAM, which U-mode can no longer
+     * reach; putting them here means a user touches nothing but its own
+     * memory.
+     */
+
+    ro = (user_rodata_t *) u->arena;
+    memset(ro, 0, sizeof(*ro));
+    strncpy(ro->user_prefix, "User ", sizeof(ro->user_prefix) - 1);
+    strncpy(ro->core_infix, " on core ", sizeof(ro->core_infix) - 1);
+    strncpy(ro->syscall_prefix, "syscall ", sizeof(ro->syscall_prefix) - 1);
+
     ctx->x[1] = (uint32_t) (uintptr_t) u_exit_stub; /* ra */
     ctx->x[2] = (uint32_t) stack_top;               /* sp */
     ctx->x[10] = u->id;                             /* a0 = user_main's arg */
+    ctx->x[11] = (uint32_t) (uintptr_t) ro;         /* a1 = its strings     */
     ctx->pc = (uint32_t) (uintptr_t) user_main;
     ctx->mcause = 0;
     ctx->mtval = 0;
@@ -745,7 +798,7 @@ static void user_ctx_init(user_slot_t *u)
      * and is reported as a user fault rather than panicking the kernel.
      */
 
-    ctx->u_sp_min = (uint32_t) (uintptr_t) u->arena;
+    ctx->u_sp_min = (uint32_t) (uintptr_t) (u->arena + sizeof(user_rodata_t));
     ctx->u_sp_max = (uint32_t) stack_top;
     ctx->sp_fired = 0;
     ctx->sp_pc = 0;
@@ -880,6 +933,112 @@ static void user_host_task(void *arg)
         u->name, (unsigned long) u->syscalls, (unsigned long) u->irqs_in_user, (unsigned long) u->migrations);
 
     vTaskDelete(NULL);
+}
+
+/****************************************************************************
+ * Name: pmp_apply
+ *
+ * Description:
+ *   Program the PMP from scratch, describing what U-mode may touch.
+ *
+ *   This project takes the PMP over rather than living with IDF's, which is
+ *   what CONFIG_BOOTLOADER_REGION_PROTECTION_ENABLE=n is for: with it off,
+ *   esp_cpu_configure_region_protection() never runs and the PMP is left in
+ *   its reset state.  That is the right place to start from -- every entry
+ *   OFF, and PMP is default-DENY for U-mode and default-allow for M-mode, so
+ *   U-mode begins with access to NOTHING and this function hands back only
+ *   what it needs.  IDF's configuration could not be worked with instead: it
+ *   locks every entry it programs, and one of them grants U-mode read and
+ *   write over the whole of internal DRAM.
+ *
+ *   Nothing here is locked, deliberately.  A PMP entry always applies to
+ *   U-mode; the lock bit only decides whether it also applies to M-mode.  Left
+ *   unlocked these constrain the user and leave the kernel's access alone,
+ *   which is what lets the kernel keep reaching memory U-mode cannot.
+ *
+ *   Per-hart, so this runs on every core.
+ *
+ ****************************************************************************/
+
+/* Prefixed because IDF's riscv/csr.h defines PMP_R and friends already. */
+
+#define UPMP_R      (1u << 0)
+#define UPMP_W      (1u << 1)
+#define UPMP_X      (1u << 2)
+#define UPMP_A_TOR  (1u << 3)
+
+static void pmp_apply(void *arg)
+{
+    const uint32_t iram_text_end = (uint32_t) (uintptr_t) &_iram_text_end;
+
+    uint32_t addr[16] = { 0 };
+    uint32_t cfg[4] = { 0 };
+    uint8_t byte[16] = { 0 };
+    int i;
+
+    (void) arg;
+
+    /* A TOR entry spans from the PREVIOUS entry's address to its own, so each
+     * range costs two entries: one holding the base with its mode OFF, which
+     * grants nothing by itself, and one carrying the limit and permissions.
+     */
+
+    /* [SOC_IRAM_LOW, _iram_text_end) -- the code U-mode executes.  Still the
+     * whole of IRAM text rather than only the user's functions; narrowing it
+     * needs the user's code in a section of its own.
+     */
+
+    addr[0] = SOC_IRAM_LOW >> 2;
+    addr[1] = iram_text_end >> 2;
+    byte[1] = UPMP_A_TOR | UPMP_R | UPMP_X;
+
+    /* The user pool, and ONLY the user pool, out of all internal data memory.
+     * This is the split.  Everything else in internal SRAM -- the kernel's
+     * heap, its task stacks, its data, the slot table in TCM -- matches no
+     * entry, and PMP is default-deny for U-mode, so none of it is reachable
+     * from a user however wild its pointers get.
+     */
+
+    addr[2] = ((uint32_t) (uintptr_t) g_user_pool) >> 2;
+    addr[3] = ((uint32_t) (uintptr_t) g_user_pool + sizeof(g_user_pool)) >> 2;
+    byte[3] = UPMP_A_TOR | UPMP_R | UPMP_W;
+
+    /* [SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH) -- all 32 MB of PSRAM, where the user
+     * arenas live.
+     */
+
+    addr[4] = SOC_EXTRAM_LOW >> 2;
+    addr[5] = SOC_EXTRAM_HIGH >> 2;
+    byte[5] = UPMP_A_TOR | UPMP_R | UPMP_W;
+
+    /* Everything else stays OFF, so U-mode cannot reach it: the peripherals,
+     * RTC RAM and ROM that IDF used to grant, and TCM, which it never did.
+     */
+
+    for (i = 0; i < 16; i++)
+    {
+        cfg[i / 4] |= (uint32_t) byte[i] << ((i % 4) * 8);
+    }
+
+    umode_pmp_program(addr, cfg);
+}
+
+/****************************************************************************
+ * Name: pmp_apply_all_cores
+ ****************************************************************************/
+static void pmp_apply_all_cores(void)
+{
+    int core;
+
+    pmp_apply(NULL);
+
+    for (core = 0; core < SOC_CPU_CORES_NUM; core++)
+    {
+        if (core != xPortGetCoreID())
+        {
+            ESP_ERROR_CHECK(esp_ipc_call_blocking(core, pmp_apply, NULL));
+        }
+    }
 }
 
 /****************************************************************************
@@ -1168,14 +1327,24 @@ void kernel_main(void)
 
 #endif
 
+    /* Describe the world to U-mode, on every core, before any window runs. */
+
+    pmp_apply_all_cores();
+
     for (int i = 0; i < USER_SLOTS; i++)
     {
         snprintf(g_slot_names[i], sizeof(g_slot_names[i]), "user%d", i);
 
         g_slots[i].name = g_slot_names[i];
         g_slots[i].id = (uint32_t) i;
-        g_slots[i].arena = g_user_arenas[i];
-        g_slots[i].arena_size = sizeof(g_user_arenas[i]);
+
+        /* Out of the on-chip user pool.  PSRAM is granted to U-mode as well
+         * and there are 32 MB of it, but the arenas are what the split is
+         * about, so they go in the memory the split governs.
+         */
+
+        g_slots[i].arena = user_pool_alloc(USER_ARENA_SIZE);
+        g_slots[i].arena_size = USER_ARENA_SIZE;
     }
 
     boot_report();

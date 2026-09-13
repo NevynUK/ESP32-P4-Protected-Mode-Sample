@@ -1,0 +1,22 @@
+menu "Protected mode demo"
+
+config UMODE_ONCHIP_USER_KB
+    int "On-chip memory granted to U-mode (KiB)"
+    default 192
+    range 64 320
+    help
+        How much of the internal SRAM belongs to the user side.
+
+        The kernel keeps everything else.  This is the whole of the on-chip
+        split: the PMP grants U-mode read and write over exactly this pool and
+        over PSRAM, and nothing else, so every other byte of internal memory --
+        the kernel's heap, its stacks, its data -- is unreachable from U-mode
+        by hardware rather than by a check the kernel makes.
+
+        The user arenas are carved out of this pool, so it must hold at least
+        USER_SLOTS * USER_ARENA_SIZE with room to spare.
+
+        It is a static array, so raising it takes internal RAM away from the
+        kernel one for one, and the build fails if it will not fit.
+
+endmenu

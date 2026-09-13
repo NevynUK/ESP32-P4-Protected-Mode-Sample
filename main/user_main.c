@@ -78,11 +78,6 @@
  * Private Data
  ****************************************************************************/
 
-/* Read-only, so both instances share them safely. */
-
-static DRAM_ATTR const char g_user_prefix[] = "User ";
-static DRAM_ATTR const char g_core_infix[] = " on core ";
-static DRAM_ATTR const char g_syscall_prefix[] = "syscall ";
 
 /****************************************************************************
  * Private Functions
@@ -158,7 +153,7 @@ static IRAM_ATTR uint32_t u_append_u32(char *dst, uint32_t pos, uint32_t val)
  *   stealing a core.
  *
  ****************************************************************************/
-void IRAM_ATTR user_main(uint32_t id)
+void IRAM_ATTR user_main(uint32_t id, const user_rodata_t *ro)
 {
     char msg[USER_MSG_MAX];
     uint32_t tick = 0;
@@ -200,7 +195,7 @@ void IRAM_ATTR user_main(uint32_t id)
 
         if ((tick % USER_MSG_PERIOD) == 0)
         {
-            pos = u_append(msg, 0, g_user_prefix);
+            pos = u_append(msg, 0, ro->user_prefix);
             pos = u_append_u32(msg, pos, id);
             msg[pos++] = '.';
             pos = u_append_u32(msg, pos, user_n++);
@@ -211,7 +206,7 @@ void IRAM_ATTR user_main(uint32_t id)
              * nothing pins this window to a core.
              */
 
-            pos = u_append(msg, pos, g_core_infix);
+            pos = u_append(msg, pos, ro->core_infix);
             pos = u_append_u32(msg, pos, u_syscall0(SYS_GETCORE));
             msg[pos++] = '\n';
             u_syscall2(SYS_WRITE, (uint32_t) (uintptr_t) msg, pos);
@@ -224,7 +219,7 @@ void IRAM_ATTR user_main(uint32_t id)
 
         if ((tick % SYSCALL_PERIOD) == 0)
         {
-            pos = u_append(msg, 0, g_syscall_prefix);
+            pos = u_append(msg, 0, ro->syscall_prefix);
             pos = u_append_u32(msg, pos, id);
             msg[pos++] = '.';
             pos = u_append_u32(msg, pos, syscall_n++);

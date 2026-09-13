@@ -206,5 +206,18 @@ uint32_t umode_read_mintstatus(void);
 uint32_t umode_read_pmpcfg(uint32_t idx);
 uint32_t umode_read_pmpaddr(uint32_t idx);
 
+/* Grant U-mode read+write over [lo, hi) using PMP entries 9 and 10, the only
+ * two this part leaves free.  Per-hart: call it on every core.
+ */
+
+void umode_pmp_grant_extram(uint32_t lo, uint32_t hi);
+
+/* Write all sixteen PMP entries.  addr[] values are pre-shifted right by two;
+ * cfg[] is the four packed pmpcfg words.  Per-hart: call it on every core, and
+ * only useful while the entries are unlocked.
+ */
+
+void umode_pmp_program(const uint32_t addr[16], const uint32_t cfg[4]);
+
 #endif /* __ASSEMBLER__ */
 #endif /* __UMODE_H */
