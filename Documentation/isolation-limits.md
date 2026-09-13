@@ -161,11 +161,19 @@ weakest link in an isolation story that is otherwise entirely software. Now it
 cannot, and [Exercise 9](exercises.md#exercise-9-scribble-on-the-kernels-slot-table)
 demonstrates the fault.
 
-The PSRAM and flash windows are not usable for this. The flash window is not
-RAM, and PSRAM is unreachable only because `CONFIG_SPIRAM` is off — enabling it
-makes IDF describe that window with a locked R+W grant, which would hand U-mode
-access to the PSRAM heap rather than protect anything. (It does not currently
-boot on this board in any case; see `sdkconfig.defaults`.)
+The flash window is not RAM, so it is no use here. **PSRAM is a different
+matter, and more interesting than it first looks.** It is enabled — 32 MB of it
+joins the heap at boot — and yet it stays in this list, because IDF does *not*
+describe the external RAM window to the PMP on this configuration. So PSRAM is
+currently reachable by the kernel and not by U-mode, exactly like TCM, only
+four thousand times larger.
+
+That also makes entries 9 and 10 useful after all. They are shadowed for
+internal DRAM, because entry 5 matches those addresses first and the lowest
+match wins — but **no entry at all matches a PSRAM address**, so entry 9 is the
+first match there. Two free, unlocked entries and a 32 MB region nobody has
+claimed is the one place the PMP can still be steered without touching IDF's
+locked configuration.
 
 Keep it in proportion. This is 1856 bytes of hardware-enforced protection in a
 system whose arenas — the thing users actually write to — are still shared
