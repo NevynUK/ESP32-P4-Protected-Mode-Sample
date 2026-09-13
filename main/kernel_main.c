@@ -892,13 +892,18 @@ static void boot_report(void)
         const user_slot_t *u = &g_slots[i];
         const uintptr_t lo = (uintptr_t) u->arena;
 
-        kprintf("KERNEL:   %s on core %d, arena %08lx..%08lx (%u bytes, stack and data)\n", u->name, u->core, (unsigned long) lo, (unsigned long) (lo + u->arena_size), (unsigned) u->arena_size);
+        /* No core is printed: nothing is pinned, so where this window runs is
+         * not decided yet and will not stay decided.  kernel_task reports the
+         * live answer once things are running.
+         */
+
+        kprintf("KERNEL:   %s arena %08lx..%08lx (%u bytes, stack and data)\n", u->name, (unsigned long) lo, (unsigned long) (lo + u->arena_size), (unsigned) u->arena_size);
     }
 
     kprintf(
         "KERNEL: the arenas are separate objects and every syscall pointer is\n"
-        "KERNEL:   checked against the calling user's own bounds, so neither\n"
-        "KERNEL:   user can reach the other's memory through the kernel\n");
+        "KERNEL:   checked against the calling user's own bounds, so no user\n"
+        "KERNEL:   can reach another's memory through the kernel\n");
 
 #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD
     kprintf("KERNEL: hardware stack guard follows each window on to its own arena,\n");
