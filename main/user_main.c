@@ -49,10 +49,28 @@
  * so a single sleeping loop covers both without a second thread.
  */
 
-#define USER_TICK_MS 1000
+#define USER_TICK_MS 200
 
-#define USER_MSG_PERIOD 2 /* ticks -- "User y" every 2 s          */
-#define SYSCALL_PERIOD 3  /* ticks -- "syscall z" every 3 s       */
+/* Loops, not seconds.  One loop is a burst of yields plus a sleep, and how
+ * long that takes depends on how many other users are competing for the two
+ * cores, so these are paced to keep eight users' output readable rather than
+ * to hit a wall-clock cadence.
+ */
+
+#define USER_MSG_PERIOD 6
+#define SYSCALL_PERIOD 9
+
+/* Yields per tick.  Enough to keep the cores oversubscribed while the other
+ * users are awake, without the console output losing its cadence.
+ */
+
+#define USER_BURST 20000
+
+/* Start each instance a third of a tick apart, so three of them spread across
+ * the period instead of two of them landing in phase.
+ */
+
+#define USER_STAGGER_MS (USER_TICK_MS / 3)
 
 #define USER_MSG_MAX 48
 
@@ -63,6 +81,7 @@
 /* Read-only, so both instances share them safely. */
 
 static DRAM_ATTR const char g_user_prefix[] = "User ";
+static DRAM_ATTR const char g_core_infix[] = " on core ";
 static DRAM_ATTR const char g_syscall_prefix[] = "syscall ";
 
 /****************************************************************************
@@ -151,10 +170,26 @@ void IRAM_ATTR user_main(uint32_t id)
      * the log rather than landing on the same second and reading as one.
      */
 
-    u_syscall1(SYS_DELAY_MS, id * (USER_TICK_MS / 2));
+    u_syscall1(SYS_DELAY_MS, id * USER_STAGGER_MS);
 
     for (;;)
     {
+        uint32_t i;
+
+        /* Stay runnable for a while before sleeping again.
+         *
+         * Without this the loop is nothing but a sleep, every user is woken by
+         * core 0 -- the only core that walks the delayed-task list -- and every
+         * window runs there.  Correct, but it makes three unpinned tasks look
+         * like three pinned ones.  Being runnable at the same time as the
+         * others is what oversubscribes the cores and gets the windows moved.
+         */
+
+        for (i = 0; i < USER_BURST; i++)
+        {
+            u_syscall0(SYS_YIELD);
+        }
+
         u_syscall1(SYS_DELAY_MS, USER_TICK_MS);
         tick++;
 
@@ -169,6 +204,15 @@ void IRAM_ATTR user_main(uint32_t id)
             pos = u_append_u32(msg, pos, id);
             msg[pos++] = '.';
             pos = u_append_u32(msg, pos, user_n++);
+
+            /* Which core is this?  U-mode cannot read mhartid -- that is a CSR
+             * and a csr instruction here is an illegal instruction -- so ask.
+             * The answer can differ from one message to the next, because
+             * nothing pins this window to a core.
+             */
+
+            pos = u_append(msg, pos, g_core_infix);
+            pos = u_append_u32(msg, pos, u_syscall0(SYS_GETCORE));
             msg[pos++] = '\n';
             u_syscall2(SYS_WRITE, (uint32_t) (uintptr_t) msg, pos);
         }
