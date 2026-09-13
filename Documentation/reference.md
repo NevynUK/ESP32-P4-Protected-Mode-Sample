@@ -55,6 +55,17 @@ Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
   `UCTX_*` offsets `umode.S` uses. `kernel_main.c` `_Static_assert`s every field,
   because the failure mode otherwise is a wild store inside a trap vector.
 
+- **PSRAM does not come up on this board, and failing at it needs a power
+  cycle.** `CONFIG_SPIRAM=y` panics the *second-stage bootloader* on a SPIMEM2
+  register with a Store/AMO access fault — identically at 200 MHz and 80 MHz,
+  so it is not timing. This is pre-rev3 v1.0 silicon and IDF v5.5.4's P4 PSRAM
+  support is written for rev3. The trap is what happens next: the same fault
+  keeps occurring **with PSRAM disabled again**, from a clean rebuild, with a
+  byte-identical `sdkconfig`, in a bootloader containing none of this project's
+  code. PSRAM VDD comes from the MPLL LDO domain and the half-configured state
+  survives an EN reset, so reflashing and resetting over RTS both achieve
+  nothing. Pull the USB lead out and put it back in.
+
 - **Only core 0 runs the full FreeRTOS tick.** ESP-IDF's
   `xTaskIncrementTick()` opens with
   `configASSERT( portGET_CORE_ID() == 0 )`, so core 0 alone walks the

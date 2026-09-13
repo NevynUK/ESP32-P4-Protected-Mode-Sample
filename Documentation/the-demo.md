@@ -25,6 +25,15 @@ KERNEL:   checked against the calling user's own bounds, so no user
 KERNEL:   can reach another's memory through the kernel
 KERNEL: hardware stack guard follows each window on to its own arena,
 KERNEL:   read from the assist_debug block of the core it runs on
+KERNEL: slot table at 30100044 (1856 bytes) -- in TCM, which no PMP entry
+                                               covers, so U-mode cannot reach it
+KERNEL: PMP entries:
+KERNEL:    4 L TOR   R-X 4ff00000..4ff0fb00
+KERNEL:    5 L TOR   RW- 4ff0fb00..4ffc0000
+...
+KERNEL: no PMP entry matches these, so U-mode cannot reach them at
+KERNEL:   all while the kernel still can:
+KERNEL:   TCM            30100000..30102000 (8 KiB)
 Kernel 1 (core 0)
 KERNEL: user0: first syscall arrived with mcause=08000008 (ECALL from U-mode) on core 0 -- user_main is running unprivileged
 ```

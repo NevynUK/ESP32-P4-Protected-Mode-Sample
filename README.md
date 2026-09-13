@@ -82,6 +82,7 @@ diagnosed and fixed in this tree, each teaching something no datasheet says.
 | 6 | [Return from `user_main`](Documentation/exercises.md#exercise-6-return-from-user_main) | The exit trampoline |
 | 7 | [Leave interrupts unmasked](Documentation/exercises.md#exercise-7-leave-interrupts-unmasked) | Why the window masks, and what is lost if it does not |
 | 8 | [Add a syscall of your own](Documentation/exercises.md#exercise-8-add-a-syscall-of-your-own) | The whole interface, including the pointer rules |
+| 9 | [Scribble on the kernel's slot table](Documentation/exercises.md#exercise-9-scribble-on-the-kernels-slot-table) | The one boundary the PMP enforces, not the kernel |
 
 ## What You Will Learn
 
