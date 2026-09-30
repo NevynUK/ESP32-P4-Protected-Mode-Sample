@@ -34,7 +34,12 @@ established that `mret` to U-mode works on this silicon.
 ./build.sh          # configure for esp32p4 if needed, then build
 ./flash.sh          # build, then flash via /dev/cu.usbmodem*
 ./monitor.sh        # console on /dev/cu.usbserial-*
+./emulate.sh        # run it under the emulator instead -- no board needed
 ```
+
+No hardware? `./emulate.sh` runs the same image under `esp-emu` and prints the
+console to your terminal. **Stop it with Ctrl-C** — the Ctrl-] that
+`idf.py monitor` uses does nothing there.
 
 **The two USB paths are not interchangeable.** `/dev/cu.usbmodem*` is the P4's
 USB-Serial/JTAG port, used by esptool and OpenOCD. `/dev/cu.usbserial-*` is the

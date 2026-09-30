@@ -20,6 +20,7 @@
 ./flash.sh          # build, then flash via /dev/cu.usbmodem*
 ./monitor.sh        # console on /dev/cu.usbserial-*
 ./clean.sh          # drop build/;  --full also drops sdkconfig
+./emulate.sh        # run under the emulator instead of a board
 ```
 
 The scripts find ESP-IDF themselves — `IDF_VERSION=5.5.3 ./build.sh` picks a
@@ -30,6 +31,34 @@ shell will not expand; `scripts/idf-env.sh` asks it for its environment with
 `-e` instead and calls `tools/idf.py` through the venv's python.
 
 Both ports are optional arguments: `./flash.sh /dev/cu.usbmodem101`.
+
+## Running Under the Emulator
+
+`./emulate.sh` runs the firmware under `esp-emu` with no board attached. It
+feeds it `build/merged-binary.bin`, which `./build.sh` now produces on every
+run via `idf.py merge-bin` — the bootloader, partition table and app flattened
+into one image.
+
+Two differences from `./monitor.sh` catch people out:
+
+- **the console comes out on your own terminal**, not over a serial port. There
+  is no `/dev/cu.*` in the picture and nothing to open separately;
+- **stop it with Ctrl-C.** The Ctrl-] that `idf.py monitor` uses does nothing,
+  because this is not `idf.py monitor`.
+
+Anything you pass is handed to `esp-emu`, so `./emulate.sh --timeout 20s` gives
+a run that ends by itself — which is what makes it scriptable in a way hardware
+is not.
+
+Three environment variables override the defaults, none of which normally need
+touching: `ESP_EMU_PSRAM` (default `32M`), `ESP_EMU_ROM` and `ESP_EMU_EFUSE`.
+
+**The eFuse image is generated if missing**, by `scripts/make-efuse.py`, as an
+ESP32-P4 revision v1.3 part. That revision is not arbitrary: `sdkconfig.defaults`
+pins the accepted range, and a part outside it is refused by the bootloader
+exactly as real silicon would be. The file is gitignored because `esp-emu`
+writes it back on exit — it is emulator state, not a fixed input. Delete it to
+get a clean part.
 
 ## Gotchas Worth Keeping
 
