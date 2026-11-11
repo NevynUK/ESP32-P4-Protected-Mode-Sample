@@ -1,17 +1,19 @@
 # scripts/idf-env.sh -- put an ESP-IDF toolchain on PATH for a NON-interactive
 # shell.  Source this; do not run it.
 #
-# The interactive way in is the alias `useidf-5-5-4`, which sources
-# ~/.espressif/tools/activate_idf_v5.5.4.sh.  That script refuses to run from a
+# The interactive way in is the alias `useidf-6-1`, which sources
+# ~/.espressif/tools/activate_idf_v6.1.sh.  That script refuses to run from a
 # shell script (it checks $0 and exits), and the `idf.py` it provides is a shell
 # alias, which a non-interactive shell will not expand.  So instead we ask it
 # for its environment with `-e` and export the parts we need ourselves, then
 # call tools/idf.py through the venv's python directly.
 #
-# Override the version with IDF_VERSION=5.5.3 ./build.sh, or point
+# The tree needs ESP-IDF 6.1 or later (6.1 renamed TCM to SPM and changed the
+# hw_stack_guard.h macros; 5.5.x no longer builds it).  Override the version
+# with IDF_VERSION=x.y ./build.sh, or point
 # IDF_ACTIVATE at an activation script anywhere.
 
-IDF_VERSION="${IDF_VERSION:-5.5.4}"
+IDF_VERSION="${IDF_VERSION:-6.1}"
 IDF_ACTIVATE="${IDF_ACTIVATE:-$HOME/.espressif/tools/activate_idf_v${IDF_VERSION}.sh}"
 
 if [ ! -f "$IDF_ACTIVATE" ]; then

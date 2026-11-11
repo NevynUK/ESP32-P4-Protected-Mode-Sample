@@ -341,14 +341,14 @@ umode_enter:
   sw    t1, UCTX_K_SP_MAX(a0)
 
   /* Install the user's, from the range the caller put in the context.  IDF's
-   * SET_BOUNDS macro takes them in a0 and a1, so the context pointer steps
+   * SET_BOUNDS macro is handed them in a0 and a1, so the context pointer steps
    * aside into t3 and comes straight back.
    */
 
   mv    t3, a0
   lw    a0, UCTX_U_SP_MIN(t3)
   lw    a1, UCTX_U_SP_MAX(t3)
-  ESP_HW_STACK_GUARD_SET_BOUNDS_CUR_CORE t0
+  ESP_HW_STACK_GUARD_SET_BOUNDS_CUR_CORE t0 a0 a1
   mv    a0, t3
 
   /* The monitor stays OFF until sp actually holds the user's stack, which is
@@ -590,7 +590,7 @@ umode_trap_entry:
   mv    t3, a0
   lw    a0, UCTX_K_SP_MIN(t3)
   lw    a1, UCTX_K_SP_MAX(t3)
-  ESP_HW_STACK_GUARD_SET_BOUNDS_CUR_CORE t0
+  ESP_HW_STACK_GUARD_SET_BOUNDS_CUR_CORE t0 a0 a1
   mv    a0, t3
 
 #endif

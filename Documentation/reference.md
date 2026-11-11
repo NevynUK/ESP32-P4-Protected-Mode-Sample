@@ -174,7 +174,7 @@ silicon wins and the TRM below is the tie-breaker.
 |---|---|
 | [ESP32-P4 Technical Reference Manual](https://www.espressif.com/sites/default/files/documentation/esp32-p4_technical_reference_manual_en.pdf) | The authority when the RISC-V documents and the hardware disagree. The interrupt matrix and its per-core routing ([3.5](hard-won-lessons.md#35-one-interrupt-source-two-monitors)), the CLIC's memory-mapped registers, and the debug assist peripheral's per-core register blocks and SP-monitor semantics ([3.1](hard-won-lessons.md#31-the-hardware-stack-guard-fires-on-the-stack-switch)) |
 | [ESP32-P4 Datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-p4_datasheet_en.pdf) | Part numbering, revisions, and the memory map the PMP entries in [Part 5](isolation-limits.md#part-5--the-limit-of-the-isolation-stated-plainly) are cut from |
-| [ESP-IDF v5.5.4 — ESP32-P4](https://docs.espressif.com/projects/esp-idf/en/v5.5.4/esp32p4/index.html) | The exact IDF version this tree is built against |
+| [ESP-IDF v6.1 — ESP32-P4](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32p4/index.html) | The exact IDF version this tree is built against |
 
 Two ESP-IDF sources are quoted directly in the code and are worth opening
 alongside it, in your local IDF checkout rather than online, so the version

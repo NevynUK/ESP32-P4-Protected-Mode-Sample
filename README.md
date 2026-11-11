@@ -9,7 +9,7 @@ talking to the kernel over a syscall interface. The privilege boundary is real:
 a `csr` instruction in user code is an illegal instruction, and `ecall` is the
 only way across.
 
-Target: M5Stack Tab5, ESP32-P4 revision **v1.0**. ESP-IDF **v5.5.4**.
+Target: M5Stack Tab5, ESP32-P4 revision **v1.0**. ESP-IDF **v6.1**.
 
 ```
 KERNEL: 8 U-mode windows, NONE of them pinned, sharing that one user_main:
@@ -46,6 +46,34 @@ USB-Serial/JTAG port, used by esptool and OpenOCD. `/dev/cu.usbserial-*` is the
 external bridge on UART0, which `sdkconfig.defaults` puts the console on
 deliberately — so the board can be reset and reflashed through one port while a
 capture is held open on the other.
+
+## Debugging
+
+`debug.cfg` is an OpenOCD configuration for the P4's built-in USB-Serial/JTAG
+port. It changes three things in Espressif's `board/esp32p4-builtin.cfg`:
+
+- **Every breakpoint becomes a hardware breakpoint.** `user_main` and the trap
+  path are `IRAM_ATTR`, and the second-stage bootloader copies IRAM from flash
+  on every reset, so a software breakpoint set before the reset is overwritten
+  and never fires (measured on this board: a breakpoint at `user_main` set
+  after `monitor reset halt` never fired as a software breakpoint, and fired at
+  once as a hardware one). The P4 has only a few triggers, so keep the number
+  of enabled breakpoints small.
+- **The board resumes when GDB detaches**, so stopping a debug session does not
+  leave the cores halted.
+- **FreeRTOS thread awareness is off.** With it on, CLion often missed the
+  first breakpoint stop (`Cannot retrieve info for thread 2` in its log), and
+  the session looked as if it was still running while the board sat halted at
+  the breakpoint. The Threads view shows the halted core rather than the task
+  list as a result.
+
+In CLion, the **Tab5 (OpenOCD)** Embedded GDB Server configuration
+(`.idea/runConfigurations/Tab5_OpenOCD.xml`) starts OpenOCD with `debug.cfg`,
+resets the board and runs `riscv32-esp-elf-gdb` against
+`cmake-build-debug-esp-idf-6.1/esp_protected.elf`. It does not flash, so flash
+the same build first, and stop any debug session before flashing because esptool
+and OpenOCD share the USB port. For the console, open the Serial Monitor tool
+window on `/dev/cu.usbserial-*` at 115200 baud.
 
 ## Documentation
 
@@ -121,7 +149,7 @@ board.
 ## Status
 
 Runs on hardware. Verified on an M5Stack Tab5 (ESP32-P4 v1.0) against ESP-IDF
-v5.5.4, console captured over UART0:
+v6.1 (and earlier v5.5.4), console captured over UART0:
 
 - the boot report confirms `user_main` lands inside the U-mode execute grant;
 - **both** windows enter U-mode and report `mcause=08000008` — `ECALL from

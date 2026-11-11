@@ -5,7 +5,7 @@
 #   ./build.sh --reconfigure  re-run cmake first (after editing sdkconfig.defaults)
 #   ./build.sh fullclean      throw the build away first
 #
-# IDF_VERSION=5.5.3 ./build.sh picks a different toolchain.
+# IDF_VERSION=x.y ./build.sh picks a different toolchain (6.1 or later).
 #
 # Always finishes with `idf.py merge-bin`, which flattens the bootloader,
 # partition table and app into build/merged-binary.bin.  That single image is
