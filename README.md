@@ -75,6 +75,11 @@ the same build first, and stop any debug session before flashing because esptool
 and OpenOCD share the USB port. For the console, open the Serial Monitor tool
 window on `/dev/cu.usbserial-*` at 115200 baud.
 
+The CLion project files hold no machine-specific paths: the CMake profile
+comes from `CMakePresets.json`, and OpenOCD and GDB from the IDF install through
+`scripts/clion/`. [scripts/clion/README.md](scripts/clion/README.md) covers the
+one-time setup on a new machine and the tool overrides.
+
 ## Documentation
 
 Written to be worked through in order. If you only read one thing, read
