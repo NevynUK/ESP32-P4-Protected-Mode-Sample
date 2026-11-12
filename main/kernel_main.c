@@ -328,7 +328,7 @@ typedef struct
  * slots is about 1.9 KiB of the 8 KiB available.
  */
 
-static TCM_DRAM_ATTR user_slot_t g_slots[USER_SLOTS];
+static SPM_DRAM_ATTR user_slot_t g_slots[USER_SLOTS];
 
 static SemaphoreHandle_t g_console_mux;
 
@@ -1070,7 +1070,7 @@ static void pmp_report(void)
         { "internal SRAM", SOC_IRAM_LOW, SOC_IRAM_HIGH },
         { "PSRAM window", SOC_EXTRAM_LOW, SOC_EXTRAM_HIGH },
         { "flash window", SOC_IROM_LOW, SOC_IROM_HIGH },
-        { "TCM", SOC_TCM_LOW, SOC_TCM_HIGH },
+        { "TCM", SOC_SPM_LOW, SOC_SPM_HIGH },
         { "RTC / LP RAM", SOC_RTC_IRAM_LOW, SOC_RTC_IRAM_HIGH },
         { "peripherals", SOC_PERIPHERAL_LOW, SOC_PERIPHERAL_HIGH },
     };
@@ -1083,7 +1083,7 @@ static void pmp_report(void)
     int i;
     int j;
 
-    kprintf("KERNEL: slot table at %08lx (%u bytes) -- %s\n", (unsigned long) (uintptr_t) g_slots, (unsigned) sizeof(g_slots), ((uintptr_t) g_slots >= SOC_TCM_LOW && (uintptr_t) g_slots + sizeof(g_slots) <= SOC_TCM_HIGH) ? "in TCM, which no PMP entry covers, so U-mode cannot reach it" : "NOT in TCM; U-mode can reach it");
+    kprintf("KERNEL: slot table at %08lx (%u bytes) -- %s\n", (unsigned long) (uintptr_t) g_slots, (unsigned) sizeof(g_slots), ((uintptr_t) g_slots >= SOC_SPM_LOW && (uintptr_t) g_slots + sizeof(g_slots) <= SOC_SPM_HIGH) ? "in TCM, which no PMP entry covers, so U-mode cannot reach it" : "NOT in TCM; U-mode can reach it");
 
     kprintf("KERNEL: PMP entries:\n");
 
