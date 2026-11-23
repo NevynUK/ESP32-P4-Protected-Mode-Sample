@@ -1,7 +1,7 @@
 /*
  * user_syscall.S -- the U-mode side of the trap.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * These are the only instructions the user application executes that are not
  * plain computation.  `ecall` is the one privileged-ish operation U-mode is

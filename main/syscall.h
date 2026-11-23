@@ -1,7 +1,7 @@
 /*
  * syscall.h -- the kernel/user ABI.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * Shared by kernel_main.c (which implements the calls) and user_main.c /
  * user_syscall.S (which make them).  This is the ONLY interface the user

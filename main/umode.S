@@ -1,7 +1,7 @@
 /*
  * umode.S -- the M-mode side of the U-mode window.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * Three things live here:
  *

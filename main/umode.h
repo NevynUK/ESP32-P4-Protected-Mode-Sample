@@ -1,7 +1,7 @@
 /*
  * umode.h -- kernel-side interface to the U-mode execution window.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * The ESP32-P4 core is an RV32 with M and U privilege modes.  ESP-IDF and
  * FreeRTOS live entirely in M-mode; this header describes the machinery that

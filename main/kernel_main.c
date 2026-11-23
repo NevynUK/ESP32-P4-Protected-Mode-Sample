@@ -1,7 +1,7 @@
 /*
  * kernel_main.c -- the protected-mode (M-mode) side of the system.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * ===========================================================================
  * WHAT THIS IS

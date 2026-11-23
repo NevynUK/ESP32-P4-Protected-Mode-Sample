@@ -2,7 +2,7 @@
  * ESP32-P4: does `mret` to U-mode with mcause.interrupt set corrupt trap
  * delivery?  Measured answer, on this silicon, in this environment: NO.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * ===========================================================================
  * READ THIS FIRST -- THE RESULT IS NEGATIVE

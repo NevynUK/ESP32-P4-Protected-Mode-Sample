@@ -1,7 +1,7 @@
 /*
  * user_main.c -- the user-space application.  Runs in U-mode.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  *
  * Everything in this file executes at the lowest privilege the ESP32-P4 core
  * offers.  That imposes three rules, and they are why the code looks the way
